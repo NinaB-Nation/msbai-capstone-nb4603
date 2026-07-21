@@ -130,6 +130,27 @@ doesn't have to re-derive this.
   outside this environment after deploy (same pattern as the live-URL
   reachability check needed for other dashboards built in this environment).
 
+## Dashboard: multi-year selection (added after initial deploy)
+
+- Country Performance's year control changed from a single `st.selectbox` to
+  `st.multiselect`. Single-year selection keeps the original design (bars
+  colored by status: pass/fail/documented-anomaly/undiagnosed-anomaly) since
+  that's the more common case and status coloring doesn't compose across
+  multiple bars per country. Selecting 2+ years switches the bar chart to
+  grouped bars colored by **year** instead (fixed categorical palette,
+  identity encoding) -- color can't mean two different things (status vs.
+  year) on the same chart, so the encoding swaps deliberately rather than
+  trying to overload one channel, and the caption discloses the swap.
+  Countries are sorted by the most recently selected year's rate so the
+  ordering stays stable and meaningful.
+- The map tab does not support multiple years (no sensible way to show N
+  years on one choropleth without animation, which was out of scope for this
+  ask) -- it shows the latest of the selected years, captioned as such.
+- Verified locally (Playwright): single-year mode unchanged, multi-year mode
+  renders grouped bars with correct sort order and legend, server survived
+  navigating both tabs repeatedly (re-checked given the earlier
+  `st.dataframe`/pyarrow segfault history in this same app).
+
 ## Deployment
 
 - **Local `docker build`/`push` is not an option**: `*.pkg.dev` is blocked by
