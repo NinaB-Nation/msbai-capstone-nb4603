@@ -42,6 +42,20 @@ STATUS_COLORS = {
     "undiagnosed": COLOR_UNDIAGNOSED,
 }
 
+# Fixed-order categorical palette (identity, never cycled arbitrarily) --
+# used for the multi-year bar chart, where color distinguishes year rather
+# than target status.
+CATEGORICAL_PALETTE = [
+    "#2a78d6",  # blue
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+]
+
 
 @st.cache_data
 def load_data():
@@ -101,72 +115,111 @@ tab_country, tab_trend, tab_anomalies, tab_methodology = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_country:
     years_available = sorted(countries["year"].dropna().unique().astype(int), reverse=True)
-    selected_year = st.selectbox("Year", years_available, index=0)
+    selected_years = st.multiselect("Year(s)", years_available, default=[years_available[0]])
+    if not selected_years:
+        st.info("Select at least one year.")
+        st.stop()
+    selected_years = sorted(selected_years)
 
-    year_df = countries[countries["year"] == selected_year].dropna(subset=["reuse_recycling_rate"]).copy()
-    year_df = year_df.sort_values("reuse_recycling_rate", ascending=True)
+    years_df = countries[countries["year"].isin(selected_years)].dropna(subset=["reuse_recycling_rate"]).copy()
 
-    n_pass = (year_df["status"] == "pass").sum()
-    n_total = len(year_df)
-    st.markdown(
-        f"**{n_pass} of {n_total}** reporting countries met the 85% reuse+recycling target in {selected_year}."
-    )
+    for yr in selected_years:
+        yr_df = years_df[years_df["year"] == yr]
+        n_pass = (yr_df["status"] == "pass").sum()
+        n_total = len(yr_df)
+        st.markdown(f"**{yr}: {n_pass} of {n_total}** reporting countries met the 85% reuse+recycling target.")
 
     bar_view, map_view = st.tabs(["Bar chart", "Map"])
 
     with bar_view:
         fig = go.Figure()
-        for status_key, label in STATUS_LABELS.items():
-            sub = year_df[year_df["status"] == status_key]
-            if sub.empty:
-                continue
-            fig.add_trace(go.Bar(
-                x=sub["reuse_recycling_rate"],
-                y=sub["country_name"],
-                orientation="h",
-                name=label,
-                marker_color=STATUS_COLORS[status_key],
-                hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
-            ))
+        if len(selected_years) == 1:
+            # Single year: color by status (pass/fail/anomaly), the primary
+            # question this chart answers.
+            year_df = years_df.sort_values("reuse_recycling_rate", ascending=True)
+            for status_key, label in STATUS_LABELS.items():
+                sub = year_df[year_df["status"] == status_key]
+                if sub.empty:
+                    continue
+                fig.add_trace(go.Bar(
+                    x=sub["reuse_recycling_rate"],
+                    y=sub["country_name"],
+                    orientation="h",
+                    name=label,
+                    marker_color=STATUS_COLORS[status_key],
+                    hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+                ))
+            barmode = "overlay"
+            legend_title = "Status"
+            caption = (
+                "Bars colored by status: green meets the 85% reuse+recycling target, red falls short, "
+                "amber/orange are years with a known reporting anomaly (see the Flagged Anomalies tab)."
+            )
+        else:
+            # Multiple years: color by year instead (identity, fixed
+            # categorical order) -- status color doesn't compose across
+            # several bars per country, so switch encodings rather than
+            # overload one color channel with two meanings.
+            country_order = (
+                years_df[years_df["year"] == selected_years[-1]]
+                .sort_values("reuse_recycling_rate", ascending=True)["country_name"]
+            )
+            for i, yr in enumerate(selected_years):
+                sub = years_df[years_df["year"] == yr].set_index("country_name").reindex(country_order).reset_index()
+                fig.add_trace(go.Bar(
+                    x=sub["reuse_recycling_rate"],
+                    y=sub["country_name"],
+                    orientation="h",
+                    name=str(yr),
+                    marker_color=CATEGORICAL_PALETTE[i % len(CATEGORICAL_PALETTE)],
+                    hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+                ))
+            barmode = "group"
+            legend_title = "Year"
+            caption = (
+                "Bars colored by year, grouped by country (sorted by the most recent selected year's rate). "
+                "Switch to a single year to see pass/fail/anomaly status coloring instead."
+            )
         fig.add_vline(x=RECYCLING_TARGET, line_dash="dash", line_color=MUTED,
                        annotation_text="85% target", annotation_font_color=INK)
+        n_countries = years_df["country_name"].nunique()
         fig.update_layout(
-            title=f"Reuse + recycling rate by country, {selected_year}",
-            barmode="overlay",
-            height=max(400, 22 * n_total),
+            title=f"Reuse + recycling rate by country, {', '.join(str(y) for y in selected_years)}",
+            barmode=barmode,
+            height=max(400, 22 * n_countries * (1 if len(selected_years) == 1 else 1.3)),
             xaxis_title="Reuse + recycling rate (%)",
             yaxis_title=None,
-            legend_title_text="Status",
+            legend_title_text=legend_title,
         )
         apply_chart_theme(fig)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "Bars colored by status: green meets the 85% reuse+recycling target, red falls short, "
-            "amber/orange are years with a known reporting anomaly (see the Flagged Anomalies tab)."
-        )
+        st.caption(caption)
 
     with map_view:
+        map_year = max(selected_years)
+        map_df = years_df[years_df["year"] == map_year]
         # Plotly's ISO-3 locationmode needs 3-letter codes, but Silver only
         # carries ISO alpha-2 (matching Eurostat's own `geo` dimension) --
         # matching on country name instead avoids adding an alpha-3 mapping
         # just for this one chart.
         fig = go.Figure(data=go.Choropleth(
-            locations=year_df["country_name"],
+            locations=map_df["country_name"],
             locationmode="country names",
-            z=year_df["reuse_recycling_rate"],
-            text=year_df["country_name"],
+            z=map_df["reuse_recycling_rate"],
+            text=map_df["country_name"],
             colorscale=[[0, "#cde2fb"], [0.5, "#3987e5"], [1, "#0d366b"]],
             marker_line_color=GRIDLINE,
             colorbar=dict(title="Rate (%)"),
             hovertemplate="%{text}: %{z:.1f}%<extra></extra>",
         ))
         fig.update_geos(scope="europe", showcountries=True, countrycolor=GRIDLINE, bgcolor="#fcfcfb")
-        fig.update_layout(title=f"Reuse + recycling rate by country, {selected_year}", height=550)
+        fig.update_layout(title=f"Reuse + recycling rate by country, {map_year}", height=550)
         apply_chart_theme(fig, legend=False)
         st.plotly_chart(fig, use_container_width=True)
+        map_note = " (the most recent of the selected years)" if len(selected_years) > 1 else ""
         st.caption(
-            "Map shows reuse+recycling rate magnitude (sequential blue), not pass/fail status -- "
-            "use the bar chart for the 85%-target color coding."
+            f"Map shows {map_year}{map_note} reuse+recycling rate magnitude (sequential blue), not "
+            "pass/fail status -- use the bar chart for the 85%-target color coding or to compare years."
         )
 
 # ---------------------------------------------------------------------------
