@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw source data lands durably in GCS, not git -- see eu_elv/DECISIONS.md
+eu_elv/pipeline/data_raw/*.csv
