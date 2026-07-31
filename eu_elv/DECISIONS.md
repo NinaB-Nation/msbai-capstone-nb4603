@@ -28,7 +28,7 @@
   unit[, waste]) -- tidy/long -- so there is no wide year-columns layout to
   pivot in Silver, unlike older Eurostat bulk TSV formats.
 
-## Automated API pull (2026-07-31) -- partially complete
+## Automated API pull (2026-07-31)
 
 The manual databrowser export was replaced with an automated pull straight
 from Eurostat's SDMX 2.1 REST API. Since `ec.europa.eu` is blocked from the
@@ -135,20 +135,74 @@ describe/execution responses). The key has been revoked and rotated.
   runtime identity, since the org-policy block on cross-project
   `iam.serviceAccounts.actAs` means it cannot run as `claude-agent@`.
 
-**Two outstanding asks, both confirmed live rather than assumed** (a
-`preflight()` check re-verifies both and refuses to run, so no
-half-created secret is left behind):
+Both prerequisites were granted by the project owner the same day, and
+`preflight()` re-verifies both on every run rather than trusting them:
 
-1. **Enable `secretmanager.googleapis.com` on `msbai-capstone-nb4603`** --
-   the API is not enabled at all; every call 403s with "has not been used in
-   project ... before or it is disabled." This is separate from IAM, and is
-   the same enable-then-wait-for-propagation step `cloudbuild` and `run`
-   each needed here.
-2. **Grant `roles/secretmanager.admin`** on `msbai-capstone-nb4603` to
+1. `secretmanager.googleapis.com` enabled on `msbai-capstone-nb4603`.
+   Separate from IAM -- while the API was off, every call 403'd with "has
+   not been used in project" regardless of roles held, and enabling it
+   changed the error to a plain permission denial. Same
+   enable-then-wait-for-propagation step `cloudbuild` and `run` each needed.
+2. `roles/secretmanager.admin` on `msbai-capstone-nb4603` for
    `claude-agent@msbai-dwd-nb4603.iam.gserviceaccount.com`.
-   `testIamPermissions` returns all five needed permissions as missing:
-   `secrets.create`, `secrets.get`, `versions.add`, `secrets.getIamPolicy`,
-   `secrets.setIamPolicy`.
+
+### Verified end to end (2026-07-31)
+
+The job ran to completion: build SUCCESS, execution
+`eu-elv-fetch-bronze-api-9sbjt`, `succeededCount 1`, completed in 1m2s.
+Both tables reloaded from the live API (`_loaded_at` 20:54 today against the
+manual tables' Jul 21), and the value diff re-run against that fresh pull is
+still clean, with the negative control still firing.
+
+**The security fix was verified against the API, not assumed.** Fetching the
+full Job resource back and probing it for `BEGIN PRIVATE KEY`, `private_key`,
+`GCP_SA_KEY_JSON`, and the active key's `private_key_id` returns no match on
+any of them. All the spec says about the key is:
+
+```
+env     [{"name":"GCP_SA_KEY_FILE","value":"/secrets/sa/key.json"}, ...]
+volumes [{"name":"sa-key","secret":{"secret":"eu-elv-fetch-sa-key",
+          "items":[{"path":"key.json","version":"latest"}]}}]
+```
+
+A path and a reference. This is the exact response shape that leaked the key
+when the spec still carried a plaintext env var; it is now safe to print,
+though `summarize_execution()` still selects named fields rather than dumping
+it, since the rule does not depend on the spec staying clean.
+
+### Four defects found on first live run
+
+The rework had never been executed -- the original session wrote the script
+and ran only the parts that worked. Each of these would have surfaced on any
+first real run; none is a regression from the Secret Manager change:
+
+- **`getIamPolicy` was POSTed.** On Secret Manager v1 it is a GET
+  (`setIamPolicy` is the POST). The wrong verb returns **404 Not Found**,
+  not 405, which reads exactly like a missing secret -- while the secret had
+  in fact just been created successfully.
+- **`addVersion` was called unconditionally**, minting a new version of
+  byte-identical key material every run. Secret Manager's Always Free tier
+  covers 6 active versions, so a few retries would have quietly exhausted it
+  -- the same free-tier constraint that drove the us-central1 bucket choice.
+  Now the latest version is compared first and the add is skipped when equal.
+- **The GCS client took no credentials**, falling back to ambient ADC. That
+  is set only when the SessionStart hook exports
+  `GOOGLE_APPLICATION_CREDENTIALS` -- and the hook no-ops in any session
+  whose user email doesn't match a committed
+  `.cloud-credentials.<email>.enc`. So the script worked in the session that
+  wrote it and died with `DefaultCredentialsError` in one where the hook
+  didn't fire, with a valid key at `KEY_PATH` the whole time. Every other
+  call in the file already passed credentials explicitly; this one didn't.
+- **The secret volume used `versions`**, the v1/Knative field name. Cloud
+  Run **v2 calls it `items`** and rejects the v1 form with
+  `400 Unknown name "versions"`.
+
+That last one cost an extra round trip because every call used bare
+`raise_for_status()`, which reports only the status line and URL and discards
+the response body -- where the API had named the offending field exactly. All
+call sites now go through a `check()` helper that raises with the API's own
+message. Surfacing it is safe: an error body is a `google.rpc.Status`, not
+the Job resource.
 
 **Worth weighing before granting either:** the explicit key may not be
 needed at all. It exists only to dodge the cross-project `actAs` block --
