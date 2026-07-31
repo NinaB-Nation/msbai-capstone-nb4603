@@ -377,7 +377,14 @@ def main():
 
     tar_path = build_tarball(tag)
     gcs_object = f"cloudbuild-src/{JOB}-src-{tag}.tar.gz"
-    storage.Client(project=PROJECT).bucket(BUCKET).blob(gcs_object).upload_from_filename(tar_path)
+    # Pass credentials explicitly, like every other call here. Left to
+    # itself the storage client falls back to ambient ADC, which only
+    # happens to be set when the SessionStart hook has exported
+    # GOOGLE_APPLICATION_CREDENTIALS -- so the script worked in the session
+    # that wrote it and failed with DefaultCredentialsError in one where
+    # the hook no-opped, despite KEY_PATH being present and valid either way.
+    storage.Client(project=PROJECT, credentials=get_creds()) \
+        .bucket(BUCKET).blob(gcs_object).upload_from_filename(tar_path)
     print(f"uploaded source -> gs://{BUCKET}/{gcs_object}")
 
     build_id, image = submit_build(get_creds(), tag, gcs_object)
