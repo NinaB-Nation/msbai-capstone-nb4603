@@ -113,7 +113,7 @@ by cell over the columns they share -- natural key
   fetch-and-load path; it is not evidence about how the pull behaves once
   Eurostat republishes.
 
-### Secret handling: reworked, still blocked on two grants
+### Secret handling: reworked and running
 
 The job passed the service-account key as a plaintext env var on the Job
 spec, which leaked it (Cloud Run's API returns env-var values in
