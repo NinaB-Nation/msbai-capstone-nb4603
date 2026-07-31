@@ -28,6 +28,39 @@
   unit[, waste]) -- tidy/long -- so there is no wide year-columns layout to
   pivot in Silver, unlike older Eurostat bulk TSV formats.
 
+## Automated API pull (2026-07-31) -- partially complete
+
+The manual databrowser export was replaced with an automated pull straight
+from Eurostat's SDMX 2.1 REST API. Since `ec.europa.eu` is blocked from the
+dev sandbox but not from GCP itself, the fetch runs as a **Cloud Run Job**
+(`pipeline/fetch_bronze_api.py` + `Dockerfile.fetch_job`), built and
+submitted via Cloud Build -- the same pattern the dashboard image uses,
+since local `docker push` to `*.pkg.dev` is also blocked.
+
+- **Lands in a new bucket**: `msbai-capstone-nb4603-eu-elv-staging-us`,
+  single-region `us-central1`. Deliberately *not* the existing
+  `msbai-capstone-nb4603-eu-elv-staging`, which is EU multi-region and so
+  doesn't qualify for GCS Always Free (that tier covers single-region US
+  buckets only).
+- **Lands in new tables**, `elv_bronze.env_waselvt_api` /
+  `env_waselv_api`, alongside rather than over the hand-verified
+  `env_waselvt_raw` / `env_waselv_raw`, so the automated pull can be diffed
+  against data already checked by hand.
+- **Schema is read from the live API's own header row**, not assumed to
+  match the manual export's; a mismatch is logged and the actual header is
+  used. (In the one run so far, no mismatch was reported.)
+- **Result of the single run**: `env_waselvt_api` 4,305 rows and
+  `env_waselv_api` 30,268 rows -- both exactly matching the manual tables'
+  row counts. Row counts only; **values have not been diffed yet.**
+
+**Blocked, and must be fixed before re-running:** the job passed the
+service-account key as a plaintext env var on the Job spec, which leaked
+the key (Cloud Run's API returns env-var values in describe/execution
+responses). The key has been revoked and rotated. `build_and_run_fetch_job.py`
+carries a "do not run as-is" banner; it needs Secret Manager (requires
+granting `claude-agent@` the `secretmanager.*` permissions it lacks) before
+this pipeline is used again.
+
 ## Silver: country-code reconciliation
 
 - Eurostat's `geo` codes match ISO 3166-1 alpha-2 for every country in this
