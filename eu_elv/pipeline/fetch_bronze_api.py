@@ -37,6 +37,7 @@ import io
 import json
 import os
 import sys
+import xml.etree.ElementTree as ET
 
 import requests
 from google.cloud import bigquery, storage
@@ -76,6 +77,108 @@ REFERENCE_HEADERS = {
         "obs_flag_label", "CONF_STATUS", "conf_status_label",
     ],
 }
+
+
+# -- codelists ---------------------------------------------------------------
+# The SDMX data endpoint returns codes, never labels -- established across
+# four probe rounds (see DECISIONS.md). Labels live in the DSD's codelists,
+# so they are fetched separately and joined in Silver. This is the
+# normalized form: one row per (codelist, code) instead of a label string
+# repeated across all 30,268 observations, and the same shape
+# country_reference already uses for geo.
+SDMX_STRUCTURE_BASE = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1"
+CODELIST_TABLE = "codelists_api"
+NS = {
+    "m": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
+    "s": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+    "c": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+}
+
+
+def discover_codelists(dataflow_id):
+    """Map each dimension/attribute of a DSD to the codelist enumerating it.
+
+    Attributes matter as much as dimensions here: obs_flag_label -- one of
+    the four labels Silver needs -- comes from an attribute's codelist, not
+    a dimension's.
+    """
+    url = f"{SDMX_STRUCTURE_BASE}/datastructure/ESTAT/{dataflow_id}"
+    resp = requests.get(url, timeout=180)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    mapping = {}
+    for kind in ("Dimension", "TimeDimension", "Attribute"):
+        for comp in root.iter(f"{{{NS['s']}}}{kind}"):
+            comp_id = comp.get("id")
+            enum = comp.find(f".//{{{NS['s']}}}Enumeration/{{{NS['c']}}}Ref")
+            if comp_id and enum is not None and enum.get("id"):
+                mapping[comp_id] = enum.get("id")
+    return mapping
+
+
+def fetch_codelist(codelist_id):
+    """Return [(code, label)] for one codelist, English names."""
+    url = f"{SDMX_STRUCTURE_BASE}/codelist/ESTAT/{codelist_id}"
+    resp = requests.get(url, timeout=180)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    codes = []
+    for code in root.iter(f"{{{NS['s']}}}Code"):
+        code_id = code.get("id")
+        label = None
+        for name in code.findall(f"{{{NS['c']}}}Name"):
+            lang = name.get("{http://www.w3.org/XML/1998/namespace}lang")
+            if lang == "en" or (label is None and lang is None):
+                label = name.text
+                if lang == "en":
+                    break
+        if code_id and label:
+            codes.append((code_id, label))
+    return codes
+
+
+def load_codelists(bq_client):
+    """Fetch every codelist backing either dataflow and load them to Bronze."""
+    rows = []
+    seen = set()
+    for dataflow_id in ("ENV_WASELVT", "ENV_WASELV"):
+        mapping = discover_codelists(dataflow_id)
+        print(f"  {dataflow_id}: {len(mapping)} components -> "
+              f"{sorted(set(mapping.values()))}")
+        for component_id, codelist_id in sorted(mapping.items()):
+            if codelist_id in seen:
+                continue
+            seen.add(codelist_id)
+            for code, label in fetch_codelist(codelist_id):
+                rows.append({
+                    "codelist_id": codelist_id,
+                    "component_id": component_id,
+                    "code": code,
+                    "label": label,
+                })
+
+    if not rows:
+        raise RuntimeError("no codelist entries fetched -- refusing to load an empty table")
+
+    table_id = f"{PROJECT}.{BRONZE_DATASET}.{CODELIST_TABLE}"
+    schema = [
+        bigquery.SchemaField("codelist_id", "STRING"),
+        bigquery.SchemaField("component_id", "STRING"),
+        bigquery.SchemaField("code", "STRING"),
+        bigquery.SchemaField("label", "STRING"),
+        bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
+    ]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for row in rows:
+        row["_loaded_at"] = now.isoformat()
+
+    job_config = bigquery.LoadJobConfig(
+        schema=schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    bq_client.load_table_from_json(rows, table_id, job_config=job_config).result()
+    print(f"  loaded {len(rows):,} codelist entries -> {table_id} "
+          f"({len(seen)} codelists)")
 
 
 # -- probe mode --------------------------------------------------------------
@@ -327,10 +430,19 @@ def main():
             print(f"  LOAD FAILED: {exc}")
             failures.append(dataset_code)
 
+    # Codelists carry the labels the observations don't. Loaded in the same
+    # run so they cannot drift out of step with the data they describe.
+    print("codelists:")
+    try:
+        load_codelists(bq_client)
+    except Exception as exc:
+        print(f"  CODELIST LOAD FAILED: {exc}")
+        failures.append("codelists")
+
     if failures:
         print(f"FAILED: {failures}")
         return 1
-    print("all datasets fetched and loaded successfully")
+    print("all datasets and codelists fetched and loaded successfully")
     return 0
 
 
