@@ -37,6 +37,7 @@ import io
 import json
 import os
 import sys
+import traceback
 import xml.etree.ElementTree as ET
 
 import requests
@@ -401,8 +402,63 @@ def load_to_bronze(bq_client, uri, table_name, csv_text):
     ])).result()
 
 
+class _Tee:
+    """Write to both the real stdout and an in-memory buffer."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
 def main():
-    creds = get_credentials()
+    """Run the pipeline, mirroring all output to a GCS run log.
+
+    claude-agent@ has no Cloud Logging read access (confirmed: 403
+    "Permission denied for all log views"), so a failed execution is
+    otherwise a black box from outside GCP -- Cloud Run reports only "the
+    container exited with an error". Rather than request a broader role,
+    every run mirrors its own output to gs://BUCKET/runs/, which the job
+    can already write. The upload happens in a finally block so a crash
+    reports itself rather than vanishing.
+    """
+    buffer = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = _Tee(real_stdout, buffer)
+    creds = None
+    started = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        creds = get_credentials()
+        return _run(creds)
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        return 1
+    finally:
+        sys.stdout = real_stdout
+        _upload_run_log(creds, buffer.getvalue(), started)
+
+
+def _upload_run_log(creds, text, started):
+    stamp = started.strftime("%Y%m%dt%H%M%S")
+    try:
+        client = storage.Client(project=PROJECT, credentials=creds)
+        path = f"runs/run_{stamp}.log"
+        client.bucket(BUCKET).blob(path).upload_from_string(
+            text, content_type="text/plain")
+        print(f"run log -> gs://{BUCKET}/{path}")
+    except Exception as exc:
+        # Never let log shipping mask the real outcome.
+        print(f"WARNING: could not upload run log: {type(exc).__name__}: {exc}")
+
+
+def _run(creds):
     storage_client = storage.Client(project=PROJECT, credentials=creds)
 
     if os.environ.get("PROBE_ONLY") == "1":
