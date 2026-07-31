@@ -94,21 +94,32 @@ def probe_formats(storage_client):
     so this runs inside the Job and writes its findings to GCS, where the
     sandbox can read them. Loads nothing; it only looks at headers.
     """
+    # Round 1 established that `format=SDMX-CSV2.0` is rejected outright
+    # (406 UNSUPPORTED_FORMAT) and that `labels=both` as a *query param* is
+    # silently ignored -- the header came back byte-identical to the
+    # baseline. SDMX REST negotiates both the CSV version and the label
+    # columns through the Accept media type instead, so these candidates
+    # vary the Accept header rather than the query string.
+    base = {"format": "SDMX-CSV", "compressed": "false"}
+    sdmx_csv = "application/vnd.sdmx.data+csv"
     candidates = [
-        {"format": "SDMX-CSV", "compressed": "false"},
-        {"format": "SDMX-CSV", "compressed": "false", "labels": "both"},
-        {"format": "SDMX-CSV2.0", "compressed": "false"},
-        {"format": "SDMX-CSV2.0", "compressed": "false", "labels": "both"},
-        {"format": "SDMX-CSV2.0", "compressed": "false", "labels": "name"},
+        {"params": base, "headers": {}},
+        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0"}},
+        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=both"}},
+        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=name"}},
+        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=1.0.0;labels=both"}},
+        {"params": {**base, "formatVersion": "2.0"}, "headers": {}},
+        {"params": {**base, "formatVersion": "2.0", "labels": "both"}, "headers": {}},
     ]
     results = []
     for dataset_code, cfg in DATASETS.items():
         target = REFERENCE_HEADERS[cfg["table"]]
-        for params in candidates:
-            entry = {"dataset": dataset_code, "params": params}
+        for candidate in candidates:
+            params, headers = candidate["params"], candidate["headers"]
+            entry = {"dataset": dataset_code, "params": params, "headers": headers}
             try:
                 resp = requests.get(f"{EUROSTAT_BASE}/{dataset_code}",
-                                    params=params, timeout=180)
+                                    params=params, headers=headers, timeout=180)
                 entry["http_status"] = resp.status_code
                 if resp.status_code == 200 and resp.text.strip():
                     reader = csv.reader(io.StringIO(resp.text))
@@ -124,7 +135,8 @@ def probe_formats(storage_client):
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             results.append(entry)
             flag = "MATCH" if entry.get("matches_manual_export") else "     "
-            print(f"  {flag} {dataset_code:12s} {params} -> "
+            accept = headers.get("Accept", "(default)")
+            print(f"  {flag} {dataset_code:12s} accept={accept} params={params} -> "
                   f"http={entry.get('http_status')} "
                   f"missing={len(entry.get('missing_vs_manual', []) or [])}")
 
