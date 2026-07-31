@@ -113,6 +113,11 @@ def preflight(creds):
     """
     problems = []
 
+    # Two different things return 403 here, and they need different fixes.
+    # "has not been used in project" means the API itself is off -- no role
+    # grant will clear it. Any other 403 is an ordinary permission denial,
+    # which the testIamPermissions check below reports far more precisely,
+    # so it is not repeated as a separate ask.
     r = requests.get(f"{SM_BASE}/secrets", headers=auth_headers(creds))
     if r.status_code == 403 and "has not been used in project" in r.text:
         problems.append(
@@ -121,9 +126,9 @@ def preflight(creds):
             f"      (allow a few minutes for propagation -- cloudbuild and run\n"
             f"      both needed that wait after being enabled)"
         )
-    elif r.status_code == 403:
+    elif r.status_code not in (200, 403):
         msg = r.json().get("error", {}).get("message", "")[:200]
-        problems.append(f"Secret Manager returned 403: {msg}")
+        problems.append(f"Secret Manager returned {r.status_code}: {msg}")
 
     r = requests.post(
         f"https://cloudresourcemanager.googleapis.com/v1/projects/{PROJECT}:testIamPermissions",
