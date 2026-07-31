@@ -176,18 +176,30 @@ def ensure_secret(creds_getter):
         r.raise_for_status()
         print(f"  secret {SECRET_ID} already exists")
 
-    r = requests.post(
-        f"{SM_BASE}/secrets/{SECRET_ID}:addVersion",
-        headers=auth_headers(creds_getter()),
-        json={"payload": {"data": base64.b64encode(key_bytes).decode()}},
-    )
-    r.raise_for_status()
-    # Print the version *name* only -- never the payload.
-    print(f"  added secret version {r.json()['name'].rsplit('/', 1)[-1]}")
+    # Only add a version if the key actually changed. Every run would
+    # otherwise mint a new version of identical material, and Secret
+    # Manager's Always Free tier covers just 6 active versions -- the same
+    # free-tier sensitivity that drove the us-central1 bucket choice.
+    payload = base64.b64encode(key_bytes).decode()
+    r = requests.get(f"{SM_BASE}/secrets/{SECRET_ID}/versions/latest:access",
+                     headers=auth_headers(creds_getter()))
+    if r.status_code == 200 and r.json().get("payload", {}).get("data") == payload:
+        print("  latest secret version already holds this key; not adding another")
+    else:
+        r = requests.post(
+            f"{SM_BASE}/secrets/{SECRET_ID}:addVersion",
+            headers=auth_headers(creds_getter()), json={"payload": {"data": payload}},
+        )
+        r.raise_for_status()
+        # Print the version *name* only -- never the payload.
+        print(f"  added secret version {r.json()['name'].rsplit('/', 1)[-1]}")
 
     # Bind secretAccessor to the job's runtime identity, on this secret only.
-    r = requests.post(f"{SM_BASE}/secrets/{SECRET_ID}:getIamPolicy",
-                      headers=auth_headers(creds_getter()))
+    # getIamPolicy is a GET on Secret Manager (setIamPolicy is a POST);
+    # POSTing it returns 404, not 405, which reads misleadingly like a
+    # missing secret.
+    r = requests.get(f"{SM_BASE}/secrets/{SECRET_ID}:getIamPolicy",
+                     headers=auth_headers(creds_getter()))
     r.raise_for_status()
     policy = r.json()
     bindings = policy.get("bindings", [])
