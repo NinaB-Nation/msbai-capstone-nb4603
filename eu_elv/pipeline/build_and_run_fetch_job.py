@@ -29,25 +29,17 @@ script now follows both:
      here selects named fields (status / conditions / counts) instead of
      dumping the object.
 
-STILL BLOCKED -- this script cannot run until two things are granted
---------------------------------------------------------------------
-Both were confirmed live against the project on 2026-07-31, not assumed:
+Prerequisites -- both granted 2026-07-31, both re-checked by preflight()
+------------------------------------------------------------------------
+  a. `secretmanager.googleapis.com` enabled on msbai-capstone-nb4603. This
+     is separate from IAM: while the API is off every call 403s with "has
+     not been used in project", no matter what roles are held.
+  b. `roles/secretmanager.admin` on msbai-capstone-nb4603 for
+     claude-agent@msbai-dwd-nb4603.iam.gserviceaccount.com, covering
+     secrets.create/get, versions.add, and secrets.get/setIamPolicy.
 
-  a. **The Secret Manager API is not enabled** on msbai-capstone-nb4603.
-     `secretmanager.googleapis.com/v1/projects/.../secrets` returns 403
-     "Secret Manager API has not been used in project ... before or it is
-     disabled." This is a separate blocker from IAM -- the same
-     enable-then-wait-for-propagation step that cloudbuild.googleapis.com
-     and run.googleapis.com each needed earlier in this project.
-
-  b. **`claude-agent@` holds none of the required Secret Manager
-     permissions.** `testIamPermissions` on the project returns all five as
-     missing: secrets.create, secrets.get, versions.add,
-     secrets.getIamPolicy, secrets.setIamPolicy. `roles/secretmanager.admin`
-     on msbai-capstone-nb4603 covers all five.
-
-preflight() checks both and exits with the exact ask rather than failing
-halfway through with a partially created secret.
+preflight() re-verifies both and refuses to run rather than failing partway
+and leaving a half-created secret behind.
 
 Runtime identity: the Job keeps Cloud Run's project-local default compute
 service account (see DECISIONS.md, "Deployment" -- an org policy blocks
@@ -103,6 +95,24 @@ def get_creds():
 
 def auth_headers(creds):
     return {"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"}
+
+
+def check(r, what):
+    """raise_for_status, but keep the API's explanation.
+
+    Bare raise_for_status() reports only the status line and URL, which for
+    a malformed Job spec means losing the one thing that identifies the bad
+    field. Safe to surface: an error body is a google.rpc.Status (message +
+    fieldViolations), not the Job resource, and the spec no longer carries
+    key material for a violation to quote back.
+    """
+    if r.status_code < 400:
+        return r
+    try:
+        message = r.json().get("error", {}).get("message", "")
+    except ValueError:
+        message = r.text[:300]
+    raise RuntimeError(f"{what}: HTTP {r.status_code} -- {message}")
 
 
 def preflight(creds):
@@ -170,10 +180,10 @@ def ensure_secret(creds_getter):
             f"{SM_BASE}/secrets?secretId={SECRET_ID}",
             headers=headers, json={"replication": {"automatic": {}}},
         )
-        r.raise_for_status()
+        check(r, "create secret")
         print(f"  created secret {SECRET_ID}")
     else:
-        r.raise_for_status()
+        check(r, "get secret")
         print(f"  secret {SECRET_ID} already exists")
 
     # Only add a version if the key actually changed. Every run would
@@ -190,7 +200,7 @@ def ensure_secret(creds_getter):
             f"{SM_BASE}/secrets/{SECRET_ID}:addVersion",
             headers=auth_headers(creds_getter()), json={"payload": {"data": payload}},
         )
-        r.raise_for_status()
+        check(r, "add secret version")
         # Print the version *name* only -- never the payload.
         print(f"  added secret version {r.json()['name'].rsplit('/', 1)[-1]}")
 
@@ -200,7 +210,7 @@ def ensure_secret(creds_getter):
     # missing secret.
     r = requests.get(f"{SM_BASE}/secrets/{SECRET_ID}:getIamPolicy",
                      headers=auth_headers(creds_getter()))
-    r.raise_for_status()
+    check(r, "get secret IAM policy")
     policy = r.json()
     bindings = policy.get("bindings", [])
     member = f"serviceAccount:{RUNTIME_SA}"
@@ -220,7 +230,7 @@ def ensure_secret(creds_getter):
         f"{SM_BASE}/secrets/{SECRET_ID}:setIamPolicy",
         headers=auth_headers(creds_getter()), json={"policy": policy},
     )
-    r.raise_for_status()
+    check(r, "set secret IAM policy")
     print(f"  granted secretAccessor on {SECRET_ID} to {RUNTIME_SA}")
 
 
@@ -245,7 +255,7 @@ def submit_build(creds, tag, gcs_object):
         f"https://cloudbuild.googleapis.com/v1/projects/{PROJECT}/builds",
         headers=auth_headers(creds), json=build_config,
     )
-    r.raise_for_status()
+    check(r, "submit build")
     return r.json()["metadata"]["build"]["id"], image
 
 
@@ -285,7 +295,10 @@ def job_spec(image):
                     "name": "sa-key",
                     "secret": {
                         "secret": SECRET_ID,
-                        "versions": [{"version": "latest", "path": SECRET_FILENAME}],
+                        # v2 calls this "items"; "versions" is the v1/Knative
+                        # spelling and is rejected with a 400 "Cannot find
+                        # field", not silently ignored.
+                        "items": [{"version": "latest", "path": SECRET_FILENAME}],
                     },
                 }],
                 "timeout": "600s",
@@ -326,14 +339,14 @@ def create_or_update_job(creds_getter, image):
         r = requests.patch(f"{RUN_BASE}/jobs/{JOB}", headers=headers, json=spec)
     else:
         r = requests.post(f"{RUN_BASE}/jobs?jobId={JOB}", headers=headers, json=spec)
-    r.raise_for_status()
+    check(r, "create/update job")
     wait_for_operation(creds_getter, r.json()["name"], "job create/update")
 
 
 def run_job(creds_getter):
     r = requests.post(f"{RUN_BASE}/jobs/{JOB}:run",
                       headers=auth_headers(creds_getter()), json={})
-    r.raise_for_status()
+    check(r, "run job")
     op = wait_for_operation(creds_getter, r.json()["name"], "job execution",
                             tries=60, delay=10)
     return op.get("response", {})
