@@ -28,6 +28,138 @@
   unit[, waste]) -- tidy/long -- so there is no wide year-columns layout to
   pivot in Silver, unlike older Eurostat bulk TSV formats.
 
+## Automated API pull (2026-07-31) -- partially complete
+
+The manual databrowser export was replaced with an automated pull straight
+from Eurostat's SDMX 2.1 REST API. Since `ec.europa.eu` is blocked from the
+dev sandbox but not from GCP itself, the fetch runs as a **Cloud Run Job**
+(`pipeline/fetch_bronze_api.py` + `Dockerfile.fetch_job`), built and
+submitted via Cloud Build -- the same pattern the dashboard image uses,
+since local `docker push` to `*.pkg.dev` is also blocked.
+
+- **Lands in a new bucket**: `msbai-capstone-nb4603-eu-elv-staging-us`,
+  single-region `us-central1`. Deliberately *not* the existing
+  `msbai-capstone-nb4603-eu-elv-staging`, which is EU multi-region and so
+  doesn't qualify for GCS Always Free (that tier covers single-region US
+  buckets only).
+- **Lands in new tables**, `elv_bronze.env_waselvt_api` /
+  `env_waselv_api`, alongside rather than over the hand-verified
+  `env_waselvt_raw` / `env_waselv_raw`, so the automated pull can be diffed
+  against data already checked by hand.
+- **Schema is read from the live API's own header row**, not assumed to
+  match the manual export's; a mismatch is logged and the actual header is
+  used.
+- **Result of the single run**: `env_waselvt_api` 4,305 rows and
+  `env_waselv_api` 30,268 rows -- both exactly matching the manual tables'
+  row counts.
+
+### Correction: the schemas do *not* match (checked 2026-07-31)
+
+An earlier version of this section recorded that "no mismatch was
+reported" on the one run. That is wrong -- the loaded tables disagree, and
+the note was written from the `run_job()` response rather than from the
+job's own logs, where `load_to_bronze()`'s mismatch NOTE would have
+appeared. The detection logic was working; nobody read its output.
+
+The manual databrowser export is SDMX-CSV **with labels**; the API pull, at
+`format=SDMX-CSV` with no `labels` parameter, returns the **codes-only**
+variant:
+
+| | `_raw` (manual) | `_api` (automated) |
+|---|---|---|
+| provenance cols | `STRUCTURE`, `STRUCTURE_ID`, `STRUCTURE_NAME` | `DATAFLOW`, `LAST UPDATE` |
+| label cols | 8-9 (`geo_label`, `unit_of_measure`, `waste_label`, `obs_flag_label`, ...) | none |
+| codes + measures | identical set | identical set |
+
+**This blocks the `_raw` -> `_api` cutover**, and row counts hid it.
+`silver_elv_detail.sql` and `silver_elv_totals.sql` select four label
+columns the API tables do not have -- `waste_management_operations`,
+`waste_label`, `unit_of_measure`, `obs_flag_label` -- so repointing Silver
+at the `_api` tables today fails at view-creation time. The likely fix is
+`format=SDMX-CSV2.0` plus `labels=both` on the fetch URL, which is what
+produces the manual export's column shape; **not verified**, because
+`ec.europa.eu` is unreachable from this sandbox, so it can only be
+confirmed from inside the Cloud Run Job.
+
+### Value-level diff: clean (`pipeline/diff_api_vs_raw.py`, 2026-07-31)
+
+Row counts matching is not a value check, so the tables were compared cell
+by cell over the columns they share -- natural key
+(`freq`, `wst_oper`, `[waste,]` `unit`, `geo`, `TIME_PERIOD`) plus measures
+(`OBS_VALUE`, `OBS_FLAG`, `CONF_STATUS`), via `FULL OUTER JOIN`:
+
+- **Zero differences in both datasets.** 4,305 / 30,268 keys matched, no key
+  present on only one side, no `OBS_VALUE` difference (string *or* numeric
+  cast), no `OBS_FLAG` difference.
+- Key uniqueness is **asserted, not assumed** -- a duplicated key would fan
+  out the join and turn a real mismatch into a passing diff. All four
+  tables are unique on it.
+- **A negative control runs every time**, because "zero differences" and
+  "the diff isn't comparing anything" look identical in the output. The same
+  comparison is re-run against an API side with `TIME_PERIOD` shifted one
+  year; it must report differences, and does (3,968 / 18,020 `OBS_VALUE`
+  diffs, 84 / 508 `OBS_FLAG` diffs). If the control ever comes back clean
+  the script fails loudly and voids the all-clear above.
+- **`CONF_STATUS`'s agreement is vacuous**: it is 100% NULL in all four
+  tables, so it cannot differ and the control cannot move it. `OBS_VALUE`
+  and `OBS_FLAG` are the only measures carrying real signal.
+- The label columns **were not diffed and could not be** -- they exist on
+  only one side (see the correction above). The clean result covers codes
+  and measures, not labels.
+- Why the values agree exactly: both loads are the same Eurostat vintage.
+  `_api` carries `LAST UPDATE = 28/04/26 11:00:00` and dataflow
+  `ESTAT:ENV_WASELVT(1.0)` / `ENV_WASELV(1.0)`, matching `_raw`'s
+  `STRUCTURE_ID`. This is a same-vintage agreement, so it validates the
+  fetch-and-load path; it is not evidence about how the pull behaves once
+  Eurostat republishes.
+
+### Secret handling: reworked, still blocked on two grants
+
+The job passed the service-account key as a plaintext env var on the Job
+spec, which leaked it (Cloud Run's API returns env-var values in
+describe/execution responses). The key has been revoked and rotated.
+`build_and_run_fetch_job.py` has been reworked:
+
+- The key is stored in Secret Manager and **mounted as a file** at
+  `/secrets/sa/key.json`; the Job spec now carries only a secret
+  *reference*, so the Admin API has no key material to echo. The container
+  reads `GCP_SA_KEY_FILE` (a path), and `fetch_bronze_api.py` now **refuses
+  `GCP_SA_KEY_JSON` outright** rather than silently accepting the shape that
+  caused the incident.
+- `summarize_execution()` replaced the raw `json.dumps(op)` -- every status
+  readout selects named fields (counts, conditions) instead of dumping the
+  object.
+- `roles/secretmanager.secretAccessor` is bound **on the secret**, not
+  project-wide, and to Cloud Run's project-local default compute SA
+  (`919371925869-compute@developer.gserviceaccount.com`) -- the job's actual
+  runtime identity, since the org-policy block on cross-project
+  `iam.serviceAccounts.actAs` means it cannot run as `claude-agent@`.
+
+**Two outstanding asks, both confirmed live rather than assumed** (a
+`preflight()` check re-verifies both and refuses to run, so no
+half-created secret is left behind):
+
+1. **Enable `secretmanager.googleapis.com` on `msbai-capstone-nb4603`** --
+   the API is not enabled at all; every call 403s with "has not been used in
+   project ... before or it is disabled." This is separate from IAM, and is
+   the same enable-then-wait-for-propagation step `cloudbuild` and `run`
+   each needed here.
+2. **Grant `roles/secretmanager.admin`** on `msbai-capstone-nb4603` to
+   `claude-agent@msbai-dwd-nb4603.iam.gserviceaccount.com`.
+   `testIamPermissions` returns all five needed permissions as missing:
+   `secrets.create`, `secrets.get`, `versions.add`, `secrets.getIamPolicy`,
+   `secrets.setIamPolicy`.
+
+**Worth weighing before granting either:** the explicit key may not be
+needed at all. It exists only to dodge the cross-project `actAs` block --
+but the job already runs as `msbai-capstone-nb4603`'s own compute SA, which
+is project-local. Granting *that* SA BigQuery + GCS roles directly would let
+`fetch_bronze_api.py` fall back to ambient ADC (already its behaviour when
+no key file is present), deleting the secret, the mount, and the key-handling
+code path together -- no key to leak, rotate, or mount. That is the smaller
+and safer surface; Secret Manager is the right answer only if the fetch must
+keep writing as the cross-project `claude-agent@` identity.
+
 ## Silver: country-code reconciliation
 
 - Eurostat's `geo` codes match ISO 3166-1 alpha-2 for every country in this
