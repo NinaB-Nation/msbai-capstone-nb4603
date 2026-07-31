@@ -182,6 +182,39 @@ def load_codelists(bq_client):
           f"({len(seen)} codelists)")
 
 
+def dump_structure(storage_client):
+    """Write raw SDMX structure XML to GCS so the parser can be written to it.
+
+    discover_codelists() found zero components in the plain
+    /datastructure response, and guessing at the XML shape from a 400-char
+    prefix is how the last three probe rounds each burned a cycle. SDMX
+    lets a structure query return a stub unless descendants are explicitly
+    requested, so these variants differ in `references`/`detail`.
+    """
+    variants = [
+        ("datastructure_plain", "datastructure/ESTAT/ENV_WASELVT", {}),
+        ("datastructure_refs_all", "datastructure/ESTAT/ENV_WASELVT",
+         {"references": "all"}),
+        ("datastructure_descendants", "datastructure/ESTAT/ENV_WASELVT",
+         {"references": "descendants", "detail": "full"}),
+        ("dataflow_refs_all", "dataflow/ESTAT/ENV_WASELVT",
+         {"references": "all"}),
+    ]
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+    for name, path, params in variants:
+        try:
+            resp = requests.get(f"{SDMX_STRUCTURE_BASE}/{path}",
+                                params=params, timeout=180)
+            blob_path = f"structure/{ts}/{name}.xml"
+            storage_client.bucket(BUCKET).blob(blob_path).upload_from_string(
+                resp.text, content_type="application/xml")
+            print(f"  {name:28s} http={resp.status_code} "
+                  f"bytes={len(resp.text):>9,} -> gs://{BUCKET}/{blob_path}")
+        except Exception as exc:
+            print(f"  {name:28s} ERROR {type(exc).__name__}: {exc}")
+    return 0
+
+
 # -- probe mode --------------------------------------------------------------
 def probe_formats(storage_client):
     """Try candidate format/labels params and report the header each returns.
@@ -460,6 +493,10 @@ def _upload_run_log(creds, text, started):
 
 def _run(creds):
     storage_client = storage.Client(project=PROJECT, credentials=creds)
+
+    if os.environ.get("DUMP_STRUCTURE") == "1":
+        print("DUMP_STRUCTURE=1 -- dumping raw SDMX structure XML, loading nothing")
+        return dump_structure(storage_client)
 
     if os.environ.get("PROBE_ONLY") == "1":
         print("PROBE_ONLY=1 -- probing API formats, loading nothing")
