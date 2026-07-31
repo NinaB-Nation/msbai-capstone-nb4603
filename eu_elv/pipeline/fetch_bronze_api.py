@@ -12,17 +12,24 @@ network egress policy (confirmed via curl and WebFetch both 403ing at the
 proxy -- see DECISIONS.md), so this is packaged to run as a Cloud Run Job,
 not invoked directly from the sandbox.
 
-Auth: takes an explicit service-account key via the GCP_SA_KEY_JSON env var
-rather than relying on the Job's attached runtime identity. A cross-project
-identity (claude-agent@msbai-dwd-nb4603) was already used successfully for
-the manual Bronze/Silver/Gold build via a decrypted key file passed as
+Auth: takes an explicit service-account key rather than relying on the Job's
+attached runtime identity. A cross-project identity
+(claude-agent@msbai-dwd-nb4603) was already used successfully for the manual
+Bronze/Silver/Gold build via a decrypted key file passed as
 GOOGLE_APPLICATION_CREDENTIALS; binding that same identity as a Cloud Run
 *Service* account hit a hard org-policy block on iam.serviceAccounts.actAs
-across projects (see DECISIONS.md, "Deployment" section). Passing the key
-as data rather than as the container's attached identity sidesteps that
-block entirely -- the job's attached identity is left at Cloud Run's
-project-local default, which needs no permissions at all, since the script
-authenticates explicitly.
+across projects (see DECISIONS.md, "Deployment" section). Passing the key as
+data rather than as the container's attached identity sidesteps that block
+entirely -- the job's attached identity stays at Cloud Run's project-local
+default, which only needs read access to the one secret below.
+
+The key arrives as a **file mounted from Secret Manager** at
+GCP_SA_KEY_FILE (default /secrets/sa/key.json), not as a
+GCP_SA_KEY_JSON env var. The env-var form leaked the key on 2026-07-31:
+Cloud Run's Admin API returns env-var values in describe/execution
+responses, so printing one to check job status put the private key into a
+session transcript. get_credentials() now refuses GCP_SA_KEY_JSON outright
+rather than silently accepting the shape that caused the incident.
 """
 import csv
 import datetime
@@ -40,6 +47,10 @@ BUCKET = os.environ.get("BUCKET", "msbai-capstone-nb4603-eu-elv-staging-us")
 BRONZE_DATASET = "elv_bronze"
 
 EUROSTAT_BASE = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data"
+
+# Path the Cloud Run Job mounts the Secret Manager secret at; overridable
+# via GCP_SA_KEY_FILE. Never holds key material itself -- just a path.
+DEFAULT_SA_KEY_FILE = "/secrets/sa/key.json"
 
 DATASETS = {
     "env_waselvt": {"table": "env_waselvt_api", "gcs_prefix": "bronze-api/env_waselvt"},
@@ -68,10 +79,29 @@ REFERENCE_HEADERS = {
 
 
 def get_credentials():
-    key_json = os.environ.get("GCP_SA_KEY_JSON")
-    if not key_json:
-        return None  # fall back to ambient ADC
-    info = json.loads(key_json)
+    """Load the SA key from the Secret Manager volume mounted by the Job.
+
+    GCP_SA_KEY_FILE is a *path* (default /secrets/sa/key.json), not key
+    material. The key used to arrive as a GCP_SA_KEY_JSON env var holding
+    the whole JSON; that leaked it, because Cloud Run's Admin API returns
+    env-var values in describe/execution responses. Reading the key from a
+    mounted secret keeps it out of the Job spec entirely.
+    """
+    key_file = os.environ.get("GCP_SA_KEY_FILE", DEFAULT_SA_KEY_FILE)
+    if not os.path.exists(key_file):
+        if os.environ.get("GCP_SA_KEY_JSON"):
+            raise RuntimeError(
+                "GCP_SA_KEY_JSON is set. Passing the service-account key as a "
+                "Cloud Run env var leaks it through the Admin API and is not "
+                "supported any more -- mount it from Secret Manager instead "
+                "(see build_and_run_fetch_job.py)."
+            )
+        print(f"  no key file at {key_file}; falling back to ambient ADC")
+        return None
+    with open(key_file) as f:
+        info = json.load(f)
+    print(f"  authenticating as {info.get('client_email')} "
+          f"(key {info.get('private_key_id', '')[:8]}..., from {key_file})")
     return service_account.Credentials.from_service_account_info(info)
 
 
