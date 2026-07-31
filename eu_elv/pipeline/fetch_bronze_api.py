@@ -96,48 +96,71 @@ NS = {
 }
 
 
-def discover_codelists(dataflow_id):
-    """Map each dimension/attribute of a DSD to the codelist enumerating it.
+XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 
-    Attributes matter as much as dimensions here: obs_flag_label -- one of
-    the four labels Silver needs -- comes from an attribute's codelist, not
-    a dimension's.
+
+def _english_name(element):
+    """Pick the English <common:Name>, falling back to an unlabelled one."""
+    fallback = None
+    for name in element.findall(f"{{{NS['c']}}}Name"):
+        lang = name.get(XML_LANG)
+        if lang == "en":
+            return name.text
+        if fallback is None:
+            fallback = name.text
+    return fallback
+
+
+def fetch_dsd(dataflow_id):
+    """Fetch one DSD with its codelists inline.
+
+    `references=descendants&detail=full` is load-bearing: the plain
+    /datastructure response is a ~6KB stub with no components at all, which
+    is why the first attempt parsed zero of them. This variant returns
+    ~3.4MB carrying both the component definitions and every codelist they
+    enumerate, so one request per dataflow replaces a discovery call plus a
+    fetch per codelist.
     """
     url = f"{SDMX_STRUCTURE_BASE}/datastructure/ESTAT/{dataflow_id}"
-    resp = requests.get(url, timeout=180)
+    resp = requests.get(
+        url, params={"references": "descendants", "detail": "full"}, timeout=180)
     resp.raise_for_status()
-    root = ET.fromstring(resp.content)
+    return ET.fromstring(resp.content)
 
+
+def component_codelists(root):
+    """Map component id -> codelist id for dimensions and attributes.
+
+    Attributes matter as much as dimensions: obs_flag_label -- one of the
+    four labels Silver needs -- is enumerated by an attribute's codelist.
+
+    The <Ref> inside <Enumeration> is in the *default* (empty) namespace,
+    not the SDMX common namespace. Qualifying it with common: matches
+    nothing and yields an empty mapping rather than an error -- the exact
+    silent-empty failure the load guard caught.
+    """
     mapping = {}
     for kind in ("Dimension", "TimeDimension", "Attribute"):
         for comp in root.iter(f"{{{NS['s']}}}{kind}"):
             comp_id = comp.get("id")
-            enum = comp.find(f".//{{{NS['s']}}}Enumeration/{{{NS['c']}}}Ref")
+            enum = comp.find(f".//{{{NS['s']}}}Enumeration/Ref")
             if comp_id and enum is not None and enum.get("id"):
                 mapping[comp_id] = enum.get("id")
     return mapping
 
 
-def fetch_codelist(codelist_id):
-    """Return [(code, label)] for one codelist, English names."""
-    url = f"{SDMX_STRUCTURE_BASE}/codelist/ESTAT/{codelist_id}"
-    resp = requests.get(url, timeout=180)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-
-    codes = []
-    for code in root.iter(f"{{{NS['s']}}}Code"):
-        code_id = code.get("id")
-        label = None
-        for name in code.findall(f"{{{NS['c']}}}Name"):
-            lang = name.get("{http://www.w3.org/XML/1998/namespace}lang")
-            if lang == "en" or (label is None and lang is None):
-                label = name.text
-                if lang == "en":
-                    break
-        if code_id and label:
-            codes.append((code_id, label))
-    return codes
+def codelists_in(root):
+    """Extract {codelist_id: [(code, label)]} from an inline-codelist DSD."""
+    out = {}
+    for codelist in root.iter(f"{{{NS['s']}}}Codelist"):
+        entries = []
+        for code in codelist.iter(f"{{{NS['s']}}}Code"):
+            code_id, label = code.get("id"), _english_name(code)
+            if code_id and label:
+                entries.append((code_id, label))
+        if codelist.get("id"):
+            out[codelist.get("id")] = entries
+    return out
 
 
 def load_codelists(bq_client):
@@ -145,14 +168,24 @@ def load_codelists(bq_client):
     rows = []
     seen = set()
     for dataflow_id in ("ENV_WASELVT", "ENV_WASELV"):
-        mapping = discover_codelists(dataflow_id)
+        root = fetch_dsd(dataflow_id)
+        mapping = component_codelists(root)
+        available = codelists_in(root)
         print(f"  {dataflow_id}: {len(mapping)} components -> "
               f"{sorted(set(mapping.values()))}")
+        if not mapping:
+            raise RuntimeError(
+                f"{dataflow_id}: parsed 0 components from the DSD -- the "
+                f"structure XML shape has changed; refusing to continue")
         for component_id, codelist_id in sorted(mapping.items()):
             if codelist_id in seen:
                 continue
             seen.add(codelist_id)
-            for code, label in fetch_codelist(codelist_id):
+            entries = available.get(codelist_id, [])
+            if not entries:
+                print(f"    WARNING: codelist {codelist_id} "
+                      f"(component {component_id}) came back empty")
+            for code, label in entries:
                 rows.append({
                     "codelist_id": codelist_id,
                     "component_id": component_id,
