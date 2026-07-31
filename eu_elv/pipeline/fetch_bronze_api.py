@@ -100,25 +100,46 @@ def probe_formats(storage_client):
     # baseline. SDMX REST negotiates both the CSV version and the label
     # columns through the Accept media type instead, so these candidates
     # vary the Accept header rather than the query string.
+    # Round 2 was inconclusive by construction: it kept format=SDMX-CSV in
+    # the query string alongside every Accept variant, and an explicit
+    # format param takes precedence over content negotiation -- so all
+    # seven candidates were really the same request. Round 3 drops the
+    # format param where it is testing Accept, tries the singular `label`
+    # spelling Eurostat's own databrowser uses, and tries the separate
+    # statistics/1.0 endpoint the databrowser downloads actually go through.
     base = {"format": "SDMX-CSV", "compressed": "false"}
     sdmx_csv = "application/vnd.sdmx.data+csv"
+    stats_base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
     candidates = [
+        # baseline, for comparison
         {"params": base, "headers": {}},
-        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0"}},
-        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=both"}},
-        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=name"}},
-        {"params": base, "headers": {"Accept": f"{sdmx_csv};version=1.0.0;labels=both"}},
-        {"params": {**base, "formatVersion": "2.0"}, "headers": {}},
-        {"params": {**base, "formatVersion": "2.0", "labels": "both"}, "headers": {}},
+        # Accept negotiation with NO format param competing with it
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=both"}},
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};version=2.0.0"}},
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};labels=both"}},
+        # singular `label`, the spelling Eurostat's databrowser uses
+        {"params": {**base, "label": "both"}, "headers": {}},
+        {"params": {**base, "label": "both", "lang": "en"}, "headers": {}},
+        {"params": {**base, "labels": "name", "lang": "en"}, "headers": {}},
+        # the statistics/1.0 endpoint rather than sdmx/2.1
+        {"params": {"format": "SDMX-CSV", "label": "both", "lang": "en"},
+         "headers": {}, "base_url": stats_base},
+        {"params": {"format": "SDMX-CSV", "lang": "en"},
+         "headers": {}, "base_url": stats_base},
     ]
     results = []
     for dataset_code, cfg in DATASETS.items():
         target = REFERENCE_HEADERS[cfg["table"]]
         for candidate in candidates:
             params, headers = candidate["params"], candidate["headers"]
-            entry = {"dataset": dataset_code, "params": params, "headers": headers}
+            base_url = candidate.get("base_url", EUROSTAT_BASE)
+            entry = {"dataset": dataset_code, "params": params,
+                     "headers": headers, "base_url": base_url}
             try:
-                resp = requests.get(f"{EUROSTAT_BASE}/{dataset_code}",
+                resp = requests.get(f"{base_url}/{dataset_code}",
                                     params=params, headers=headers, timeout=180)
                 entry["http_status"] = resp.status_code
                 if resp.status_code == 200 and resp.text.strip():
@@ -136,8 +157,9 @@ def probe_formats(storage_client):
             results.append(entry)
             flag = "MATCH" if entry.get("matches_manual_export") else "     "
             accept = headers.get("Accept", "(default)")
-            print(f"  {flag} {dataset_code:12s} accept={accept} params={params} -> "
-                  f"http={entry.get('http_status')} "
+            ep = "stats1.0" if "statistics/1.0" in base_url else "sdmx2.1"
+            print(f"  {flag} {dataset_code:12s} [{ep}] accept={accept} "
+                  f"params={params} -> http={entry.get('http_status')} "
                   f"missing={len(entry.get('missing_vs_manual', []) or [])}")
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
