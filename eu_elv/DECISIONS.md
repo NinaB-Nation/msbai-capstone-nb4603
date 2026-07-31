@@ -103,7 +103,63 @@ SDMX-ML rather than honouring an `Accept` CSV media type at all.
 
 So the `_api` tables are not deficient; they are the normalized form. The
 open choice is where labels get resolved, and that is a Silver-layer
-decision rather than a fetch-URL one -- see the recommendation below.
+decision rather than a fetch-URL one -- resolved below.
+
+### Cutover done: labels resolved in Silver, `_raw` -> `_api` complete
+
+Labels now come from Eurostat's own codelists rather than from inlined
+export columns. `fetch_bronze_api.py` loads
+`elv_bronze.codelists_api` (5,290 entries, 7 codelists) in the same
+execution as the data, so the two cannot drift apart;
+`elv_silver.code_reference` exposes it as `(codelist_id, code, label)`;
+and `elv_totals` / `elv_detail` now read the `_api` tables and join it for
+`operation_label`, `waste_category_label`, `unit_label`, `obs_flag_label`.
+
+Getting the codelists took two fixes, both found by reading the actual
+document rather than guessing:
+
+- **The plain `/datastructure` response is a ~6KB stub** with no component
+  definitions at all -- the first attempt parsed zero components from it.
+  `references=descendants&detail=full` returns ~3.4MB carrying the
+  components *and* every codelist inline, which also collapses a discovery
+  call plus one fetch per codelist into one request per dataflow.
+- **`<Ref>` inside `<Enumeration>` is in the default (empty) namespace**,
+  not SDMX `common`. Qualifying it matched nothing and produced an *empty
+  mapping rather than an error* -- caught only because `load_codelists()`
+  refuses to load an empty table. Without that guard the run would have
+  "succeeded" and blanked every label in Silver. It now also raises if a
+  DSD parses to zero components.
+
+**Verified before and after, not assumed:**
+
+- All **29 distinct codes** actually used by the ELV datasets resolve to
+  labels **byte-identical** to the databrowser export's -- no casing or
+  punctuation drift, so the cutover changes no label text.
+- `(codelist_id, code)` is unique across all 5,290 rows. Checked
+  explicitly, because a duplicate would fan out the join and silently
+  inflate observation counts -- the same class of error the Bronze diff
+  guards against with its key-uniqueness assertion.
+- The pre-cutover views were snapshotted and diffed against the rebuilt
+  ones with a full-row `EXCEPT DISTINCT` in **both** directions:
+  `elv_totals` 4,305 rows and `elv_detail` 30,268 rows, **identical
+  schemas and zero differing rows either way**. Row counts alone would not
+  have been evidence -- they already matched before any of this work.
+- Zero unresolved labels: no join misses on operation, waste, unit, or
+  (non-blank) obs_flag in either view.
+- Gold rebuilds unchanged on the new Silver: `elv_country_year` still 543
+  rows.
+
+The snapshot tables were dropped after the diff rather than left behind to
+go stale.
+
+**Operational note:** `claude-agent@` has no Cloud Logging read access
+(403, "Permission denied for all log views"), so a failed Cloud Run
+execution reports only "the container exited with an error". Rather than
+request a broader role, every run now mirrors its stdout to
+`gs://<staging bucket>/runs/run_<ts>.log` from a `finally` block -- a
+bucket the job can already write. That is what turned this failure from an
+opaque exit code into the exact failing step, and it is worth keeping for
+anything else that runs in there.
 
 **Two lessons from the probe itself**, both worth more than the answer:
 
