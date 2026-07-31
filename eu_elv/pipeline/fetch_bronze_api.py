@@ -130,7 +130,38 @@ def probe_formats(storage_client):
         {"params": {"format": "SDMX-CSV", "lang": "en"},
          "headers": {}, "base_url": stats_base},
     ]
+    # Round 4 also asks a structurally different question. Labels are
+    # code->name mappings that live in the DSD/codelists, not in the
+    # observations; the databrowser inlines them, the SDMX data endpoint
+    # does not. If no data-endpoint parameter produces them, the fix is to
+    # fetch the codelists once and join in Silver -- which is better
+    # modelling anyway, and is exactly what country_reference already does
+    # for geo. These probe whether those endpoints are reachable and what
+    # they return.
+    disc = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1"
+    structure_probes = [
+        {"name": "datastructure ENV_WASELVT",
+         "url": f"{disc}/datastructure/ESTAT/ENV_WASELVT"},
+        {"name": "dataflow ENV_WASELVT",
+         "url": f"{disc}/dataflow/ESTAT/ENV_WASELVT"},
+    ]
+
     results = []
+    for probe in structure_probes:
+        entry = {"dataset": "(structure)", "params": {}, "headers": {},
+                 "base_url": probe["url"], "probe_name": probe["name"]}
+        try:
+            resp = requests.get(probe["url"], timeout=180)
+            entry["http_status"] = resp.status_code
+            entry["content_type"] = resp.headers.get("Content-Type", "")
+            entry["body_prefix"] = resp.text[:400]
+            entry["body_bytes"] = len(resp.text)
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(entry)
+        print(f"  STRUCT {probe['name']:28s} -> http={entry.get('http_status')} "
+              f"bytes={entry.get('body_bytes')}")
+
     for dataset_code, cfg in DATASETS.items():
         target = REFERENCE_HEADERS[cfg["table"]]
         for candidate in candidates:
@@ -142,16 +173,24 @@ def probe_formats(storage_client):
                 resp = requests.get(f"{base_url}/{dataset_code}",
                                     params=params, headers=headers, timeout=180)
                 entry["http_status"] = resp.status_code
+                entry["content_type"] = resp.headers.get("Content-Type", "")
+                # Always record what came back. Round 3 lost two of its most
+                # interesting results because csv.reader raised before
+                # anything was captured -- an unparseable body is a finding,
+                # not a failure to record.
+                entry["body_prefix"] = resp.text[:400]
+                entry["body_bytes"] = len(resp.text)
                 if resp.status_code == 200 and resp.text.strip():
-                    reader = csv.reader(io.StringIO(resp.text))
-                    header = next(reader)
-                    entry["header"] = header
-                    entry["n_data_rows"] = sum(1 for _ in reader)
-                    entry["matches_manual_export"] = (header == target)
-                    entry["missing_vs_manual"] = [c for c in target if c not in header]
-                    entry["extra_vs_manual"] = [c for c in header if c not in target]
-                else:
-                    entry["body_prefix"] = resp.text[:200]
+                    try:
+                        reader = csv.reader(io.StringIO(resp.text))
+                        header = next(reader)
+                        entry["header"] = header
+                        entry["n_data_rows"] = sum(1 for _ in reader)
+                        entry["matches_manual_export"] = (header == target)
+                        entry["missing_vs_manual"] = [c for c in target if c not in header]
+                        entry["extra_vs_manual"] = [c for c in header if c not in target]
+                    except Exception as exc:
+                        entry["parse_error"] = f"{type(exc).__name__}: {exc}"
             except Exception as exc:
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             results.append(entry)
