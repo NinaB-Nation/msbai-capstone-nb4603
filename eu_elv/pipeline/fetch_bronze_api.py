@@ -78,6 +78,64 @@ REFERENCE_HEADERS = {
 }
 
 
+# -- probe mode --------------------------------------------------------------
+def probe_formats(storage_client):
+    """Try candidate format/labels params and report the header each returns.
+
+    The automated pull currently lands codes-only columns, while the manual
+    databrowser export carries the human-readable label columns that
+    silver_elv_detail.sql and silver_elv_totals.sql select
+    (waste_management_operations, waste_label, unit_of_measure,
+    obs_flag_label). Until that gap closes, Silver cannot be repointed at
+    the _api tables.
+
+    Which parameter combination reproduces the manual export's shape cannot
+    be determined from the dev sandbox -- ec.europa.eu is blocked there --
+    so this runs inside the Job and writes its findings to GCS, where the
+    sandbox can read them. Loads nothing; it only looks at headers.
+    """
+    candidates = [
+        {"format": "SDMX-CSV", "compressed": "false"},
+        {"format": "SDMX-CSV", "compressed": "false", "labels": "both"},
+        {"format": "SDMX-CSV2.0", "compressed": "false"},
+        {"format": "SDMX-CSV2.0", "compressed": "false", "labels": "both"},
+        {"format": "SDMX-CSV2.0", "compressed": "false", "labels": "name"},
+    ]
+    results = []
+    for dataset_code, cfg in DATASETS.items():
+        target = REFERENCE_HEADERS[cfg["table"]]
+        for params in candidates:
+            entry = {"dataset": dataset_code, "params": params}
+            try:
+                resp = requests.get(f"{EUROSTAT_BASE}/{dataset_code}",
+                                    params=params, timeout=180)
+                entry["http_status"] = resp.status_code
+                if resp.status_code == 200 and resp.text.strip():
+                    reader = csv.reader(io.StringIO(resp.text))
+                    header = next(reader)
+                    entry["header"] = header
+                    entry["n_data_rows"] = sum(1 for _ in reader)
+                    entry["matches_manual_export"] = (header == target)
+                    entry["missing_vs_manual"] = [c for c in target if c not in header]
+                    entry["extra_vs_manual"] = [c for c in header if c not in target]
+                else:
+                    entry["body_prefix"] = resp.text[:200]
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            results.append(entry)
+            flag = "MATCH" if entry.get("matches_manual_export") else "     "
+            print(f"  {flag} {dataset_code:12s} {params} -> "
+                  f"http={entry.get('http_status')} "
+                  f"missing={len(entry.get('missing_vs_manual', []) or [])}")
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+    path = f"probe/formats_{ts}.json"
+    storage_client.bucket(BUCKET).blob(path).upload_from_string(
+        json.dumps(results, indent=2), content_type="application/json")
+    print(f"probe results -> gs://{BUCKET}/{path}")
+    return 0
+
+
 def get_credentials():
     """Load the SA key from the Secret Manager volume mounted by the Job.
 
@@ -170,6 +228,11 @@ def load_to_bronze(bq_client, uri, table_name, csv_text):
 def main():
     creds = get_credentials()
     storage_client = storage.Client(project=PROJECT, credentials=creds)
+
+    if os.environ.get("PROBE_ONLY") == "1":
+        print("PROBE_ONLY=1 -- probing API formats, loading nothing")
+        return probe_formats(storage_client)
+
     bq_client = bigquery.Client(project=PROJECT, credentials=creds)
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")

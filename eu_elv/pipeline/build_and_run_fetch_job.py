@@ -343,9 +343,16 @@ def create_or_update_job(creds_getter, image):
     wait_for_operation(creds_getter, r.json()["name"], "job create/update")
 
 
-def run_job(creds_getter):
+def run_job(creds_getter, probe=False):
+    # Cloud Run applies containerOverrides per execution, so probe mode needs
+    # no separate job spec or redeploy -- the deployed job is unchanged.
+    body = {}
+    if probe:
+        body = {"overrides": {"containerOverrides": [
+            {"env": [{"name": "PROBE_ONLY", "value": "1"}]}
+        ]}}
     r = requests.post(f"{RUN_BASE}/jobs/{JOB}:run",
-                      headers=auth_headers(creds_getter()), json={})
+                      headers=auth_headers(creds_getter()), json=body)
     check(r, "run job")
     op = wait_for_operation(creds_getter, r.json()["name"], "job execution",
                             tries=60, delay=10)
@@ -378,6 +385,7 @@ def summarize_execution(execution):
 
 
 def main():
+    probe = "--probe" in sys.argv
     creds = get_creds()
     if not preflight(creds):
         return 1
@@ -410,8 +418,10 @@ def main():
 
     create_or_update_job(get_creds, image)
     print(f"job {JOB} created/updated (key mounted from secret {SECRET_ID})")
+    if probe:
+        print("running in PROBE mode: headers only, no BigQuery load")
 
-    execution = run_job(get_creds)
+    execution = run_job(get_creds, probe=probe)
     ok = summarize_execution(execution)
     print("EXECUTION SUCCEEDED" if ok else "EXECUTION FAILED -- check Cloud Run job logs")
     return 0 if ok else 1
