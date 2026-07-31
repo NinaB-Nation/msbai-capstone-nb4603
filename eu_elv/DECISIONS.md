@@ -75,11 +75,51 @@ variant:
 `silver_elv_detail.sql` and `silver_elv_totals.sql` select four label
 columns the API tables do not have -- `waste_management_operations`,
 `waste_label`, `unit_of_measure`, `obs_flag_label` -- so repointing Silver
-at the `_api` tables today fails at view-creation time. The likely fix is
-`format=SDMX-CSV2.0` plus `labels=both` on the fetch URL, which is what
-produces the manual export's column shape; **not verified**, because
-`ec.europa.eu` is unreachable from this sandbox, so it can only be
-confirmed from inside the Cloud Run Job.
+at the `_api` tables today fails at view-creation time.
+
+### Resolved: no data-endpoint parameter produces the label columns
+
+The guess above (`format=SDMX-CSV2.0` + `labels=both`) was **wrong**, and so
+was every other URL-shaped hypothesis. Tested live from inside the Cloud Run
+Job across four probe rounds (`PROBE_ONLY=1`, results written to
+`gs://.../probe/`), since `ec.europa.eu` is unreachable from the sandbox:
+
+| attempt | result |
+|---|---|
+| `format=SDMX-CSV2.0` | **406** `UNSUPPORTED_FORMAT` -- not a valid value |
+| `labels=both`, `label=both`, `labels=name`, `lang=en` | **silently ignored** -- header byte-identical to baseline |
+| `Accept: application/vnd.sdmx.data+csv;version=2.0.0;labels=both` | **ignored**; served `Content-Type: application/vnd.sdmx.genericdata+xml` -- i.e. SDMX-ML, not CSV |
+| `statistics/1.0/data` endpoint | **400** `Invalid value for 'wsOutputFormat' parameter` |
+| `datastructure/ESTAT/ENV_WASELVT` | **200**, SDMX structure XML, 5,976 bytes |
+| `dataflow/ESTAT/ENV_WASELVT` | **200**, SDMX structure XML, 4,034 bytes |
+
+Every parseable candidate returned exactly one distinct header. The
+conclusion is structural, not a matter of finding the right flag: **labels
+are code->name mappings that live in the DSD and codelists, not in the
+observations.** The databrowser inlines them when it builds an export; the
+SDMX data endpoint returns codes and expects the consumer to resolve them.
+Dropping `format=SDMX-CSV` doesn't help either -- Eurostat then serves
+SDMX-ML rather than honouring an `Accept` CSV media type at all.
+
+So the `_api` tables are not deficient; they are the normalized form. The
+open choice is where labels get resolved, and that is a Silver-layer
+decision rather than a fetch-URL one -- see the recommendation below.
+
+**Two lessons from the probe itself**, both worth more than the answer:
+
+- **Round 2 was inconclusive by construction.** It varied the `Accept`
+  header while leaving `format=SDMX-CSV` in the query string, and an
+  explicit `format` param overrides content negotiation -- so all seven
+  "different" candidates issued the same request. All fourteen results
+  coming back byte-identical was the tell, and it initially read like strong
+  evidence rather than a broken experiment. A probe that cannot distinguish
+  its candidates produces confident-looking uniform output.
+- **Round 3 discarded its two most informative results.** `csv.reader`
+  raised on an unparseable body before anything was recorded, so the one
+  response that genuinely differed from all the others was logged only as an
+  exception string. Recording `Content-Type` unconditionally is what finally
+  identified it as SDMX-ML -- and that single header is what turned four
+  rounds of negative results into a structural explanation.
 
 ### Value-level diff: clean (`pipeline/diff_api_vs_raw.py`, 2026-07-31)
 
