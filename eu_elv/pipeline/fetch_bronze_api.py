@@ -37,6 +37,8 @@ import io
 import json
 import os
 import sys
+import traceback
+import xml.etree.ElementTree as ET
 
 import requests
 from google.cloud import bigquery, storage
@@ -76,6 +78,305 @@ REFERENCE_HEADERS = {
         "obs_flag_label", "CONF_STATUS", "conf_status_label",
     ],
 }
+
+
+# -- codelists ---------------------------------------------------------------
+# The SDMX data endpoint returns codes, never labels -- established across
+# four probe rounds (see DECISIONS.md). Labels live in the DSD's codelists,
+# so they are fetched separately and joined in Silver. This is the
+# normalized form: one row per (codelist, code) instead of a label string
+# repeated across all 30,268 observations, and the same shape
+# country_reference already uses for geo.
+SDMX_STRUCTURE_BASE = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1"
+CODELIST_TABLE = "codelists_api"
+NS = {
+    "m": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
+    "s": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+    "c": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+}
+
+
+XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+
+
+def _english_name(element):
+    """Pick the English <common:Name>, falling back to an unlabelled one."""
+    fallback = None
+    for name in element.findall(f"{{{NS['c']}}}Name"):
+        lang = name.get(XML_LANG)
+        if lang == "en":
+            return name.text
+        if fallback is None:
+            fallback = name.text
+    return fallback
+
+
+def fetch_dsd(dataflow_id):
+    """Fetch one DSD with its codelists inline.
+
+    `references=descendants&detail=full` is load-bearing: the plain
+    /datastructure response is a ~6KB stub with no components at all, which
+    is why the first attempt parsed zero of them. This variant returns
+    ~3.4MB carrying both the component definitions and every codelist they
+    enumerate, so one request per dataflow replaces a discovery call plus a
+    fetch per codelist.
+    """
+    url = f"{SDMX_STRUCTURE_BASE}/datastructure/ESTAT/{dataflow_id}"
+    resp = requests.get(
+        url, params={"references": "descendants", "detail": "full"}, timeout=180)
+    resp.raise_for_status()
+    return ET.fromstring(resp.content)
+
+
+def component_codelists(root):
+    """Map component id -> codelist id for dimensions and attributes.
+
+    Attributes matter as much as dimensions: obs_flag_label -- one of the
+    four labels Silver needs -- is enumerated by an attribute's codelist.
+
+    The <Ref> inside <Enumeration> is in the *default* (empty) namespace,
+    not the SDMX common namespace. Qualifying it with common: matches
+    nothing and yields an empty mapping rather than an error -- the exact
+    silent-empty failure the load guard caught.
+    """
+    mapping = {}
+    for kind in ("Dimension", "TimeDimension", "Attribute"):
+        for comp in root.iter(f"{{{NS['s']}}}{kind}"):
+            comp_id = comp.get("id")
+            enum = comp.find(f".//{{{NS['s']}}}Enumeration/Ref")
+            if comp_id and enum is not None and enum.get("id"):
+                mapping[comp_id] = enum.get("id")
+    return mapping
+
+
+def codelists_in(root):
+    """Extract {codelist_id: [(code, label)]} from an inline-codelist DSD."""
+    out = {}
+    for codelist in root.iter(f"{{{NS['s']}}}Codelist"):
+        entries = []
+        for code in codelist.iter(f"{{{NS['s']}}}Code"):
+            code_id, label = code.get("id"), _english_name(code)
+            if code_id and label:
+                entries.append((code_id, label))
+        if codelist.get("id"):
+            out[codelist.get("id")] = entries
+    return out
+
+
+def load_codelists(bq_client):
+    """Fetch every codelist backing either dataflow and load them to Bronze."""
+    rows = []
+    seen = set()
+    for dataflow_id in ("ENV_WASELVT", "ENV_WASELV"):
+        root = fetch_dsd(dataflow_id)
+        mapping = component_codelists(root)
+        available = codelists_in(root)
+        print(f"  {dataflow_id}: {len(mapping)} components -> "
+              f"{sorted(set(mapping.values()))}")
+        if not mapping:
+            raise RuntimeError(
+                f"{dataflow_id}: parsed 0 components from the DSD -- the "
+                f"structure XML shape has changed; refusing to continue")
+        for component_id, codelist_id in sorted(mapping.items()):
+            if codelist_id in seen:
+                continue
+            seen.add(codelist_id)
+            entries = available.get(codelist_id, [])
+            if not entries:
+                print(f"    WARNING: codelist {codelist_id} "
+                      f"(component {component_id}) came back empty")
+            for code, label in entries:
+                rows.append({
+                    "codelist_id": codelist_id,
+                    "component_id": component_id,
+                    "code": code,
+                    "label": label,
+                })
+
+    if not rows:
+        raise RuntimeError("no codelist entries fetched -- refusing to load an empty table")
+
+    table_id = f"{PROJECT}.{BRONZE_DATASET}.{CODELIST_TABLE}"
+    schema = [
+        bigquery.SchemaField("codelist_id", "STRING"),
+        bigquery.SchemaField("component_id", "STRING"),
+        bigquery.SchemaField("code", "STRING"),
+        bigquery.SchemaField("label", "STRING"),
+        bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
+    ]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for row in rows:
+        row["_loaded_at"] = now.isoformat()
+
+    job_config = bigquery.LoadJobConfig(
+        schema=schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    bq_client.load_table_from_json(rows, table_id, job_config=job_config).result()
+    print(f"  loaded {len(rows):,} codelist entries -> {table_id} "
+          f"({len(seen)} codelists)")
+
+
+def dump_structure(storage_client):
+    """Write raw SDMX structure XML to GCS so the parser can be written to it.
+
+    discover_codelists() found zero components in the plain
+    /datastructure response, and guessing at the XML shape from a 400-char
+    prefix is how the last three probe rounds each burned a cycle. SDMX
+    lets a structure query return a stub unless descendants are explicitly
+    requested, so these variants differ in `references`/`detail`.
+    """
+    variants = [
+        ("datastructure_plain", "datastructure/ESTAT/ENV_WASELVT", {}),
+        ("datastructure_refs_all", "datastructure/ESTAT/ENV_WASELVT",
+         {"references": "all"}),
+        ("datastructure_descendants", "datastructure/ESTAT/ENV_WASELVT",
+         {"references": "descendants", "detail": "full"}),
+        ("dataflow_refs_all", "dataflow/ESTAT/ENV_WASELVT",
+         {"references": "all"}),
+    ]
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+    for name, path, params in variants:
+        try:
+            resp = requests.get(f"{SDMX_STRUCTURE_BASE}/{path}",
+                                params=params, timeout=180)
+            blob_path = f"structure/{ts}/{name}.xml"
+            storage_client.bucket(BUCKET).blob(blob_path).upload_from_string(
+                resp.text, content_type="application/xml")
+            print(f"  {name:28s} http={resp.status_code} "
+                  f"bytes={len(resp.text):>9,} -> gs://{BUCKET}/{blob_path}")
+        except Exception as exc:
+            print(f"  {name:28s} ERROR {type(exc).__name__}: {exc}")
+    return 0
+
+
+# -- probe mode --------------------------------------------------------------
+def probe_formats(storage_client):
+    """Try candidate format/labels params and report the header each returns.
+
+    The automated pull currently lands codes-only columns, while the manual
+    databrowser export carries the human-readable label columns that
+    silver_elv_detail.sql and silver_elv_totals.sql select
+    (waste_management_operations, waste_label, unit_of_measure,
+    obs_flag_label). Until that gap closes, Silver cannot be repointed at
+    the _api tables.
+
+    Which parameter combination reproduces the manual export's shape cannot
+    be determined from the dev sandbox -- ec.europa.eu is blocked there --
+    so this runs inside the Job and writes its findings to GCS, where the
+    sandbox can read them. Loads nothing; it only looks at headers.
+    """
+    # Round 1 established that `format=SDMX-CSV2.0` is rejected outright
+    # (406 UNSUPPORTED_FORMAT) and that `labels=both` as a *query param* is
+    # silently ignored -- the header came back byte-identical to the
+    # baseline. SDMX REST negotiates both the CSV version and the label
+    # columns through the Accept media type instead, so these candidates
+    # vary the Accept header rather than the query string.
+    # Round 2 was inconclusive by construction: it kept format=SDMX-CSV in
+    # the query string alongside every Accept variant, and an explicit
+    # format param takes precedence over content negotiation -- so all
+    # seven candidates were really the same request. Round 3 drops the
+    # format param where it is testing Accept, tries the singular `label`
+    # spelling Eurostat's own databrowser uses, and tries the separate
+    # statistics/1.0 endpoint the databrowser downloads actually go through.
+    base = {"format": "SDMX-CSV", "compressed": "false"}
+    sdmx_csv = "application/vnd.sdmx.data+csv"
+    stats_base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
+    candidates = [
+        # baseline, for comparison
+        {"params": base, "headers": {}},
+        # Accept negotiation with NO format param competing with it
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};version=2.0.0;labels=both"}},
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};version=2.0.0"}},
+        {"params": {"compressed": "false"},
+         "headers": {"Accept": f"{sdmx_csv};labels=both"}},
+        # singular `label`, the spelling Eurostat's databrowser uses
+        {"params": {**base, "label": "both"}, "headers": {}},
+        {"params": {**base, "label": "both", "lang": "en"}, "headers": {}},
+        {"params": {**base, "labels": "name", "lang": "en"}, "headers": {}},
+        # the statistics/1.0 endpoint rather than sdmx/2.1
+        {"params": {"format": "SDMX-CSV", "label": "both", "lang": "en"},
+         "headers": {}, "base_url": stats_base},
+        {"params": {"format": "SDMX-CSV", "lang": "en"},
+         "headers": {}, "base_url": stats_base},
+    ]
+    # Round 4 also asks a structurally different question. Labels are
+    # code->name mappings that live in the DSD/codelists, not in the
+    # observations; the databrowser inlines them, the SDMX data endpoint
+    # does not. If no data-endpoint parameter produces them, the fix is to
+    # fetch the codelists once and join in Silver -- which is better
+    # modelling anyway, and is exactly what country_reference already does
+    # for geo. These probe whether those endpoints are reachable and what
+    # they return.
+    disc = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1"
+    structure_probes = [
+        {"name": "datastructure ENV_WASELVT",
+         "url": f"{disc}/datastructure/ESTAT/ENV_WASELVT"},
+        {"name": "dataflow ENV_WASELVT",
+         "url": f"{disc}/dataflow/ESTAT/ENV_WASELVT"},
+    ]
+
+    results = []
+    for probe in structure_probes:
+        entry = {"dataset": "(structure)", "params": {}, "headers": {},
+                 "base_url": probe["url"], "probe_name": probe["name"]}
+        try:
+            resp = requests.get(probe["url"], timeout=180)
+            entry["http_status"] = resp.status_code
+            entry["content_type"] = resp.headers.get("Content-Type", "")
+            entry["body_prefix"] = resp.text[:400]
+            entry["body_bytes"] = len(resp.text)
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(entry)
+        print(f"  STRUCT {probe['name']:28s} -> http={entry.get('http_status')} "
+              f"bytes={entry.get('body_bytes')}")
+
+    for dataset_code, cfg in DATASETS.items():
+        target = REFERENCE_HEADERS[cfg["table"]]
+        for candidate in candidates:
+            params, headers = candidate["params"], candidate["headers"]
+            base_url = candidate.get("base_url", EUROSTAT_BASE)
+            entry = {"dataset": dataset_code, "params": params,
+                     "headers": headers, "base_url": base_url}
+            try:
+                resp = requests.get(f"{base_url}/{dataset_code}",
+                                    params=params, headers=headers, timeout=180)
+                entry["http_status"] = resp.status_code
+                entry["content_type"] = resp.headers.get("Content-Type", "")
+                # Always record what came back. Round 3 lost two of its most
+                # interesting results because csv.reader raised before
+                # anything was captured -- an unparseable body is a finding,
+                # not a failure to record.
+                entry["body_prefix"] = resp.text[:400]
+                entry["body_bytes"] = len(resp.text)
+                if resp.status_code == 200 and resp.text.strip():
+                    try:
+                        reader = csv.reader(io.StringIO(resp.text))
+                        header = next(reader)
+                        entry["header"] = header
+                        entry["n_data_rows"] = sum(1 for _ in reader)
+                        entry["matches_manual_export"] = (header == target)
+                        entry["missing_vs_manual"] = [c for c in target if c not in header]
+                        entry["extra_vs_manual"] = [c for c in header if c not in target]
+                    except Exception as exc:
+                        entry["parse_error"] = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            results.append(entry)
+            flag = "MATCH" if entry.get("matches_manual_export") else "     "
+            accept = headers.get("Accept", "(default)")
+            ep = "stats1.0" if "statistics/1.0" in base_url else "sdmx2.1"
+            print(f"  {flag} {dataset_code:12s} [{ep}] accept={accept} "
+                  f"params={params} -> http={entry.get('http_status')} "
+                  f"missing={len(entry.get('missing_vs_manual', []) or [])}")
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+    path = f"probe/formats_{ts}.json"
+    storage_client.bucket(BUCKET).blob(path).upload_from_string(
+        json.dumps(results, indent=2), content_type="application/json")
+    print(f"probe results -> gs://{BUCKET}/{path}")
+    return 0
 
 
 def get_credentials():
@@ -167,9 +468,73 @@ def load_to_bronze(bq_client, uri, table_name, csv_text):
     ])).result()
 
 
+class _Tee:
+    """Write to both the real stdout and an in-memory buffer."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
 def main():
-    creds = get_credentials()
+    """Run the pipeline, mirroring all output to a GCS run log.
+
+    claude-agent@ has no Cloud Logging read access (confirmed: 403
+    "Permission denied for all log views"), so a failed execution is
+    otherwise a black box from outside GCP -- Cloud Run reports only "the
+    container exited with an error". Rather than request a broader role,
+    every run mirrors its own output to gs://BUCKET/runs/, which the job
+    can already write. The upload happens in a finally block so a crash
+    reports itself rather than vanishing.
+    """
+    buffer = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = _Tee(real_stdout, buffer)
+    creds = None
+    started = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        creds = get_credentials()
+        return _run(creds)
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        return 1
+    finally:
+        sys.stdout = real_stdout
+        _upload_run_log(creds, buffer.getvalue(), started)
+
+
+def _upload_run_log(creds, text, started):
+    stamp = started.strftime("%Y%m%dt%H%M%S")
+    try:
+        client = storage.Client(project=PROJECT, credentials=creds)
+        path = f"runs/run_{stamp}.log"
+        client.bucket(BUCKET).blob(path).upload_from_string(
+            text, content_type="text/plain")
+        print(f"run log -> gs://{BUCKET}/{path}")
+    except Exception as exc:
+        # Never let log shipping mask the real outcome.
+        print(f"WARNING: could not upload run log: {type(exc).__name__}: {exc}")
+
+
+def _run(creds):
     storage_client = storage.Client(project=PROJECT, credentials=creds)
+
+    if os.environ.get("DUMP_STRUCTURE") == "1":
+        print("DUMP_STRUCTURE=1 -- dumping raw SDMX structure XML, loading nothing")
+        return dump_structure(storage_client)
+
+    if os.environ.get("PROBE_ONLY") == "1":
+        print("PROBE_ONLY=1 -- probing API formats, loading nothing")
+        return probe_formats(storage_client)
+
     bq_client = bigquery.Client(project=PROJECT, credentials=creds)
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
@@ -191,10 +556,19 @@ def main():
             print(f"  LOAD FAILED: {exc}")
             failures.append(dataset_code)
 
+    # Codelists carry the labels the observations don't. Loaded in the same
+    # run so they cannot drift out of step with the data they describe.
+    print("codelists:")
+    try:
+        load_codelists(bq_client)
+    except Exception as exc:
+        print(f"  CODELIST LOAD FAILED: {exc}")
+        failures.append("codelists")
+
     if failures:
         print(f"FAILED: {failures}")
         return 1
-    print("all datasets fetched and loaded successfully")
+    print("all datasets and codelists fetched and loaded successfully")
     return 0
 
 

@@ -9,6 +9,7 @@ SQL_DIR = os.path.join(os.path.dirname(__file__), "sql")
 
 STATEMENTS = [
     "silver_country_reference.sql",
+    "silver_code_reference.sql",
     "silver_elv_totals.sql",
     "silver_elv_detail.sql",
 ]

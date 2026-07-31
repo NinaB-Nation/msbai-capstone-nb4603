@@ -1,4 +1,4 @@
--- Silver: cleaned, typed, tidy view over env_waselvt_raw (ELV totals by
+-- Silver: cleaned, typed, tidy view over env_waselvt_api (ELV totals by
 -- country/year/operation/unit). Eurostat's SDMX-CSV "linear" export is
 -- already one row per (geo, year, wst_oper, unit) -- long/tidy -- so there
 -- is no wide-year-columns layout to pivot here.
@@ -20,15 +20,21 @@ SELECT
   c.is_aggregate,
   CAST(r.TIME_PERIOD AS INT64) AS year,
   r.wst_oper AS operation_code,
-  r.waste_management_operations AS operation_label,
+  op.label AS operation_label,
   r.unit AS unit_code,
-  r.unit_of_measure AS unit_label,
+  un.label AS unit_label,
   SAFE_CAST(r.OBS_VALUE AS FLOAT64) AS obs_value,
   COALESCE(r.OBS_FLAG = 'e', FALSE) AS is_estimated,
   COALESCE(r.OBS_FLAG = 'i', FALSE) AS is_imputed,
   COALESCE(r.OBS_FLAG = 'u', FALSE) AS is_low_reliability,
   r.OBS_FLAG AS obs_flag_raw,
-  r.obs_flag_label
-FROM `msbai-capstone-nb4603.elv_bronze.env_waselvt_raw` r
+  fl.label AS obs_flag_label
+FROM `msbai-capstone-nb4603.elv_bronze.env_waselvt_api` r
 LEFT JOIN `msbai-capstone-nb4603.elv_silver.country_reference` c
-  ON r.geo = c.geo_code;
+  ON r.geo = c.geo_code
+LEFT JOIN `msbai-capstone-nb4603.elv_silver.code_reference` op
+  ON op.codelist_id = 'WST_OPER' AND op.code = r.wst_oper
+LEFT JOIN `msbai-capstone-nb4603.elv_silver.code_reference` un
+  ON un.codelist_id = 'UNIT' AND un.code = r.unit
+LEFT JOIN `msbai-capstone-nb4603.elv_silver.code_reference` fl
+  ON fl.codelist_id = 'OBS_FLAG' AND fl.code = r.OBS_FLAG;

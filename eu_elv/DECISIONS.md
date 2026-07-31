@@ -28,7 +28,7 @@
   unit[, waste]) -- tidy/long -- so there is no wide year-columns layout to
   pivot in Silver, unlike older Eurostat bulk TSV formats.
 
-## Automated API pull (2026-07-31) -- partially complete
+## Automated API pull (2026-07-31)
 
 The manual databrowser export was replaced with an automated pull straight
 from Eurostat's SDMX 2.1 REST API. Since `ec.europa.eu` is blocked from the
@@ -75,11 +75,107 @@ variant:
 `silver_elv_detail.sql` and `silver_elv_totals.sql` select four label
 columns the API tables do not have -- `waste_management_operations`,
 `waste_label`, `unit_of_measure`, `obs_flag_label` -- so repointing Silver
-at the `_api` tables today fails at view-creation time. The likely fix is
-`format=SDMX-CSV2.0` plus `labels=both` on the fetch URL, which is what
-produces the manual export's column shape; **not verified**, because
-`ec.europa.eu` is unreachable from this sandbox, so it can only be
-confirmed from inside the Cloud Run Job.
+at the `_api` tables today fails at view-creation time.
+
+### Resolved: no data-endpoint parameter produces the label columns
+
+The guess above (`format=SDMX-CSV2.0` + `labels=both`) was **wrong**, and so
+was every other URL-shaped hypothesis. Tested live from inside the Cloud Run
+Job across four probe rounds (`PROBE_ONLY=1`, results written to
+`gs://.../probe/`), since `ec.europa.eu` is unreachable from the sandbox:
+
+| attempt | result |
+|---|---|
+| `format=SDMX-CSV2.0` | **406** `UNSUPPORTED_FORMAT` -- not a valid value |
+| `labels=both`, `label=both`, `labels=name`, `lang=en` | **silently ignored** -- header byte-identical to baseline |
+| `Accept: application/vnd.sdmx.data+csv;version=2.0.0;labels=both` | **ignored**; served `Content-Type: application/vnd.sdmx.genericdata+xml` -- i.e. SDMX-ML, not CSV |
+| `statistics/1.0/data` endpoint | **400** `Invalid value for 'wsOutputFormat' parameter` |
+| `datastructure/ESTAT/ENV_WASELVT` | **200**, SDMX structure XML, 5,976 bytes |
+| `dataflow/ESTAT/ENV_WASELVT` | **200**, SDMX structure XML, 4,034 bytes |
+
+Every parseable candidate returned exactly one distinct header. The
+conclusion is structural, not a matter of finding the right flag: **labels
+are code->name mappings that live in the DSD and codelists, not in the
+observations.** The databrowser inlines them when it builds an export; the
+SDMX data endpoint returns codes and expects the consumer to resolve them.
+Dropping `format=SDMX-CSV` doesn't help either -- Eurostat then serves
+SDMX-ML rather than honouring an `Accept` CSV media type at all.
+
+So the `_api` tables are not deficient; they are the normalized form. The
+open choice is where labels get resolved, and that is a Silver-layer
+decision rather than a fetch-URL one -- resolved below.
+
+### Cutover done: labels resolved in Silver, `_raw` -> `_api` complete
+
+Labels now come from Eurostat's own codelists rather than from inlined
+export columns. `fetch_bronze_api.py` loads
+`elv_bronze.codelists_api` (5,290 entries, 7 codelists) in the same
+execution as the data, so the two cannot drift apart;
+`elv_silver.code_reference` exposes it as `(codelist_id, code, label)`;
+and `elv_totals` / `elv_detail` now read the `_api` tables and join it for
+`operation_label`, `waste_category_label`, `unit_label`, `obs_flag_label`.
+
+Getting the codelists took two fixes, both found by reading the actual
+document rather than guessing:
+
+- **The plain `/datastructure` response is a ~6KB stub** with no component
+  definitions at all -- the first attempt parsed zero components from it.
+  `references=descendants&detail=full` returns ~3.4MB carrying the
+  components *and* every codelist inline, which also collapses a discovery
+  call plus one fetch per codelist into one request per dataflow.
+- **`<Ref>` inside `<Enumeration>` is in the default (empty) namespace**,
+  not SDMX `common`. Qualifying it matched nothing and produced an *empty
+  mapping rather than an error* -- caught only because `load_codelists()`
+  refuses to load an empty table. Without that guard the run would have
+  "succeeded" and blanked every label in Silver. It now also raises if a
+  DSD parses to zero components.
+
+**Verified before and after, not assumed:**
+
+- All **29 distinct codes** actually used by the ELV datasets resolve to
+  labels **byte-identical** to the databrowser export's -- no casing or
+  punctuation drift, so the cutover changes no label text.
+- `(codelist_id, code)` is unique across all 5,290 rows. Checked
+  explicitly, because a duplicate would fan out the join and silently
+  inflate observation counts -- the same class of error the Bronze diff
+  guards against with its key-uniqueness assertion.
+- The pre-cutover views were snapshotted and diffed against the rebuilt
+  ones with a full-row `EXCEPT DISTINCT` in **both** directions:
+  `elv_totals` 4,305 rows and `elv_detail` 30,268 rows, **identical
+  schemas and zero differing rows either way**. Row counts alone would not
+  have been evidence -- they already matched before any of this work.
+- Zero unresolved labels: no join misses on operation, waste, unit, or
+  (non-blank) obs_flag in either view.
+- Gold rebuilds unchanged on the new Silver: `elv_country_year` still 543
+  rows.
+
+The snapshot tables were dropped after the diff rather than left behind to
+go stale.
+
+**Operational note:** `claude-agent@` has no Cloud Logging read access
+(403, "Permission denied for all log views"), so a failed Cloud Run
+execution reports only "the container exited with an error". Rather than
+request a broader role, every run now mirrors its stdout to
+`gs://<staging bucket>/runs/run_<ts>.log` from a `finally` block -- a
+bucket the job can already write. That is what turned this failure from an
+opaque exit code into the exact failing step, and it is worth keeping for
+anything else that runs in there.
+
+**Two lessons from the probe itself**, both worth more than the answer:
+
+- **Round 2 was inconclusive by construction.** It varied the `Accept`
+  header while leaving `format=SDMX-CSV` in the query string, and an
+  explicit `format` param overrides content negotiation -- so all seven
+  "different" candidates issued the same request. All fourteen results
+  coming back byte-identical was the tell, and it initially read like strong
+  evidence rather than a broken experiment. A probe that cannot distinguish
+  its candidates produces confident-looking uniform output.
+- **Round 3 discarded its two most informative results.** `csv.reader`
+  raised on an unparseable body before anything was recorded, so the one
+  response that genuinely differed from all the others was logged only as an
+  exception string. Recording `Content-Type` unconditionally is what finally
+  identified it as SDMX-ML -- and that single header is what turned four
+  rounds of negative results into a structural explanation.
 
 ### Value-level diff: clean (`pipeline/diff_api_vs_raw.py`, 2026-07-31)
 
@@ -113,7 +209,7 @@ by cell over the columns they share -- natural key
   fetch-and-load path; it is not evidence about how the pull behaves once
   Eurostat republishes.
 
-### Secret handling: reworked, still blocked on two grants
+### Secret handling: reworked and running
 
 The job passed the service-account key as a plaintext env var on the Job
 spec, which leaked it (Cloud Run's API returns env-var values in
@@ -135,20 +231,74 @@ describe/execution responses). The key has been revoked and rotated.
   runtime identity, since the org-policy block on cross-project
   `iam.serviceAccounts.actAs` means it cannot run as `claude-agent@`.
 
-**Two outstanding asks, both confirmed live rather than assumed** (a
-`preflight()` check re-verifies both and refuses to run, so no
-half-created secret is left behind):
+Both prerequisites were granted by the project owner the same day, and
+`preflight()` re-verifies both on every run rather than trusting them:
 
-1. **Enable `secretmanager.googleapis.com` on `msbai-capstone-nb4603`** --
-   the API is not enabled at all; every call 403s with "has not been used in
-   project ... before or it is disabled." This is separate from IAM, and is
-   the same enable-then-wait-for-propagation step `cloudbuild` and `run`
-   each needed here.
-2. **Grant `roles/secretmanager.admin`** on `msbai-capstone-nb4603` to
+1. `secretmanager.googleapis.com` enabled on `msbai-capstone-nb4603`.
+   Separate from IAM -- while the API was off, every call 403'd with "has
+   not been used in project" regardless of roles held, and enabling it
+   changed the error to a plain permission denial. Same
+   enable-then-wait-for-propagation step `cloudbuild` and `run` each needed.
+2. `roles/secretmanager.admin` on `msbai-capstone-nb4603` for
    `claude-agent@msbai-dwd-nb4603.iam.gserviceaccount.com`.
-   `testIamPermissions` returns all five needed permissions as missing:
-   `secrets.create`, `secrets.get`, `versions.add`, `secrets.getIamPolicy`,
-   `secrets.setIamPolicy`.
+
+### Verified end to end (2026-07-31)
+
+The job ran to completion: build SUCCESS, execution
+`eu-elv-fetch-bronze-api-9sbjt`, `succeededCount 1`, completed in 1m2s.
+Both tables reloaded from the live API (`_loaded_at` 20:54 today against the
+manual tables' Jul 21), and the value diff re-run against that fresh pull is
+still clean, with the negative control still firing.
+
+**The security fix was verified against the API, not assumed.** Fetching the
+full Job resource back and probing it for `BEGIN PRIVATE KEY`, `private_key`,
+`GCP_SA_KEY_JSON`, and the active key's `private_key_id` returns no match on
+any of them. All the spec says about the key is:
+
+```
+env     [{"name":"GCP_SA_KEY_FILE","value":"/secrets/sa/key.json"}, ...]
+volumes [{"name":"sa-key","secret":{"secret":"eu-elv-fetch-sa-key",
+          "items":[{"path":"key.json","version":"latest"}]}}]
+```
+
+A path and a reference. This is the exact response shape that leaked the key
+when the spec still carried a plaintext env var; it is now safe to print,
+though `summarize_execution()` still selects named fields rather than dumping
+it, since the rule does not depend on the spec staying clean.
+
+### Four defects found on first live run
+
+The rework had never been executed -- the original session wrote the script
+and ran only the parts that worked. Each of these would have surfaced on any
+first real run; none is a regression from the Secret Manager change:
+
+- **`getIamPolicy` was POSTed.** On Secret Manager v1 it is a GET
+  (`setIamPolicy` is the POST). The wrong verb returns **404 Not Found**,
+  not 405, which reads exactly like a missing secret -- while the secret had
+  in fact just been created successfully.
+- **`addVersion` was called unconditionally**, minting a new version of
+  byte-identical key material every run. Secret Manager's Always Free tier
+  covers 6 active versions, so a few retries would have quietly exhausted it
+  -- the same free-tier constraint that drove the us-central1 bucket choice.
+  Now the latest version is compared first and the add is skipped when equal.
+- **The GCS client took no credentials**, falling back to ambient ADC. That
+  is set only when the SessionStart hook exports
+  `GOOGLE_APPLICATION_CREDENTIALS` -- and the hook no-ops in any session
+  whose user email doesn't match a committed
+  `.cloud-credentials.<email>.enc`. So the script worked in the session that
+  wrote it and died with `DefaultCredentialsError` in one where the hook
+  didn't fire, with a valid key at `KEY_PATH` the whole time. Every other
+  call in the file already passed credentials explicitly; this one didn't.
+- **The secret volume used `versions`**, the v1/Knative field name. Cloud
+  Run **v2 calls it `items`** and rejects the v1 form with
+  `400 Unknown name "versions"`.
+
+That last one cost an extra round trip because every call used bare
+`raise_for_status()`, which reports only the status line and URL and discards
+the response body -- where the API had named the offending field exactly. All
+call sites now go through a `check()` helper that raises with the API's own
+message. Surfacing it is safe: an error body is a `google.rpc.Status`, not
+the Job resource.
 
 **Worth weighing before granting either:** the explicit key may not be
 needed at all. It exists only to dodge the cross-project `actAs` block --
