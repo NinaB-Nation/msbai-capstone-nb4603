@@ -248,6 +248,40 @@ def dump_structure(storage_client):
     return 0
 
 
+# -- additional dataflows ------------------------------------------------------
+def fetch_extra_dataflows(storage_client, bq_client, codes):
+    """Pull arbitrary Eurostat dataflows into Bronze.
+
+    Added to test whether the collapse in reported ELVs reflects vehicles
+    leaving the country or simply being kept longer. Answering that needs
+    vehicle-stock data alongside the ELV series, and ec.europa.eu is only
+    reachable from inside GCP -- so the fetch has to happen here.
+
+    Schema comes from whatever header the API returns; these dataflows have
+    no entry in REFERENCE_HEADERS and none is required.
+    """
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+    failures = []
+    for code in codes:
+        code = code.strip()
+        if not code:
+            continue
+        print(f"{code}:")
+        try:
+            text = fetch_csv(code)
+        except Exception as exc:
+            print(f"  FETCH FAILED: {exc}")
+            failures.append(code)
+            continue
+        uri = upload_to_gcs(storage_client, text, f"bronze-api/extra/{code}_{ts}.csv")
+        try:
+            load_to_bronze(bq_client, uri, f"{code}_api", text)
+        except Exception as exc:
+            print(f"  LOAD FAILED: {exc}")
+            failures.append(code)
+    return failures
+
+
 # -- probe mode --------------------------------------------------------------
 def probe_formats(storage_client):
     """Try candidate format/labels params and report the header each returns.
@@ -428,8 +462,8 @@ def upload_to_gcs(storage_client, text, gcs_path):
 
 def load_to_bronze(bq_client, uri, table_name, csv_text):
     header = next(csv.reader(io.StringIO(csv_text)))
-    expected = REFERENCE_HEADERS[table_name]
-    if header != expected:
+    expected = REFERENCE_HEADERS.get(table_name)
+    if expected is not None and header != expected:
         print(f"  NOTE: live API header differs from the manual-export header for {table_name}")
         print(f"    expected: {expected}")
         print(f"    actual:   {header}")
@@ -526,6 +560,17 @@ def _upload_run_log(creds, text, started):
 
 def _run(creds):
     storage_client = storage.Client(project=PROJECT, credentials=creds)
+
+    extra = os.environ.get("EXTRA_DATAFLOWS")
+    if extra:
+        print(f"EXTRA_DATAFLOWS set -- fetching {extra}, skipping the ELV load")
+        bq_client = bigquery.Client(project=PROJECT, credentials=creds)
+        failures = fetch_extra_dataflows(storage_client, bq_client, extra.split(","))
+        if failures:
+            print(f"FAILED: {failures}")
+            return 1
+        print("extra dataflows loaded successfully")
+        return 0
 
     if os.environ.get("DUMP_STRUCTURE") == "1":
         print("DUMP_STRUCTURE=1 -- dumping raw SDMX structure XML, loading nothing")

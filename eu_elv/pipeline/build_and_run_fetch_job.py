@@ -343,7 +343,7 @@ def create_or_update_job(creds_getter, image):
     wait_for_operation(creds_getter, r.json()["name"], "job create/update")
 
 
-def run_job(creds_getter, probe=False, dump=False):
+def run_job(creds_getter, probe=False, dump=False, extra=None):
     # Cloud Run applies containerOverrides per execution, so probe mode needs
     # no separate job spec or redeploy -- the deployed job is unchanged.
     body = {}
@@ -352,6 +352,8 @@ def run_job(creds_getter, probe=False, dump=False):
         env.append({"name": "PROBE_ONLY", "value": "1"})
     if dump:
         env.append({"name": "DUMP_STRUCTURE", "value": "1"})
+    if extra:
+        env.append({"name": "EXTRA_DATAFLOWS", "value": extra})
     if env:
         body = {"overrides": {"containerOverrides": [{"env": env}]}}
     r = requests.post(f"{RUN_BASE}/jobs/{JOB}:run",
@@ -390,6 +392,7 @@ def summarize_execution(execution):
 def main():
     probe = "--probe" in sys.argv
     dump = "--dump-structure" in sys.argv
+    extra = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--extra=")), None)
     creds = get_creds()
     if not preflight(creds):
         return 1
@@ -425,7 +428,7 @@ def main():
     if probe:
         print("running in PROBE mode: headers only, no BigQuery load")
 
-    execution = run_job(get_creds, probe=probe, dump=dump)
+    execution = run_job(get_creds, probe=probe, dump=dump, extra=extra)
     ok = summarize_execution(execution)
     print("EXECUTION SUCCEEDED" if ok else "EXECUTION FAILED -- check Cloud Run job logs")
     return 0 if ok else 1
