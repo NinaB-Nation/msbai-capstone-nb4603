@@ -4,7 +4,8 @@
 **GCP project:** `msbai-capstone-nb4603`, dataset `elv_bronze`
 **Eurostat vintage:** 28 April 2026 (no repull; all figures from the validated path)
 **Analysis date:** 19 September 2026
-**Comparator:** Netherlands method, mirrored for direct comparability
+**Companion note:** `netherlands_figures_review.md`, which carries the
+comparator data issues found while producing this
 
 **Labelling convention used throughout.** Every number is tagged:
 
@@ -34,9 +35,9 @@ And the fourth, which is the important one for your Antwerp question:
 
 4. **Belgium's `EXP` code is not used-vehicle exports.** It is "End-of-life
    vehicles exported", reported in **tonnes of waste**, not in vehicle
-   counts. The Netherlands figure of 237,875 is a **count of vehicles**. The
-   two are not the same measurement and a ratio built from them is not a
-   like-for-like comparison. Detail in section 4.
+   counts. Used vehicles shipped abroad for resale leave the fleet through
+   deregistration and appear in no ELV statistic at all, so the two are not
+   the same measurement. Detail in section 4.
 
 ---
 
@@ -49,8 +50,8 @@ And the fourth, which is the important one for your Antwerp question:
 | `env_waselvt_api` | 144 | 2006 to 2023 | 18 | 0 |
 | `env_waselv_api` | 1,375 | 2006 to 2023 | 18 | 0 |
 
-**Note:** Belgium's series begins at **2006**, not 2005. If the Netherlands
-run used 2005 as the start year, the panels are one year offset.
+**Note:** Belgium's series begins at **2006**, not 2005. Any panel built
+alongside countries whose series start in 2005 will be one year offset.
 
 ### 1.1 Category codes, resolved against the Eurostat codelist
 
@@ -288,10 +289,9 @@ Ferrous:  33,904 t x 340 USD/t  =  11,527,360 USD
 | PGM value share | P9, catalyst mass reported but not PGM content | **cannot compute** |
 | Semiconductor value share | P10, no category exists | **cannot compute** |
 
-**Therefore the Netherlands headline contrast cannot be reproduced for
-Belgium from this data.** The Netherlands figure states steel at about 2
-percent of value against 40 to 41 percent concentrated in copper, catalytic
-converters and semiconductors. **Every one of those three components is an
+**Therefore a mass-share against value-share contrast cannot be computed
+for Belgium from this data.** Any such contrast turns on copper, catalytic
+converter PGMs and semiconductors, and **every one of those three is an
 [OPEN] input for Belgium.** I am not going to substitute plausible numbers to
 fill that shape, because the resulting contrast would be an artefact of my
 assumptions rather than a finding about Belgium.
@@ -299,12 +299,12 @@ assumptions rather than a finding about Belgium.
 **[DERIVED] What can be said.** Ferrous is **45.3 percent of the mass**. The
 combined non-ferrous fraction that would contain all the copper is **6.6
 percent of the mass**, and catalysts, which contain all the PGMs, are **0.12
-percent of the mass**. If the Netherlands value structure holds
-approximately in Belgium, then a mass share of 45.3 percent in the cheapest
-material and 6.7 percent combined in the expensive ones reproduces the same
-qualitative inversion. **But that is a conditional statement resting on the
-Netherlands result, not an independent Belgian measurement, and it should be
-presented as such.**
+percent of the mass**. The mass is therefore concentrated in the cheapest
+material, while the materials that carry most of the value sit in fractions
+of a few percent. That is the **precondition** for a value inversion.
+**Whether the inversion actually holds in Belgium cannot be established
+without the [OPEN] inputs above, and must not be asserted from the mass
+shares alone.**
 
 **To close the gap you need exactly two numbers:** the copper share of
 `W191002`, and grams of PGM per tonne of catalyst. Both are obtainable from
@@ -448,10 +448,10 @@ Source: Eurostat road equipment stock, same 28 April 2026 vintage, already in
 vehicles exported".** The 2023 values are 5,371 t on a `GEN` basis and 5,020 t
 across treatment operations.
 
-**The Netherlands comparator of 237,875 is a count of vehicles.** These are
-different measurements of different populations:
+**Two different populations are easily conflated here**, and any
+export-to-fleet ratio depends entirely on which one is meant:
 
-| | Netherlands figure | Belgium `EXP` |
+| | Used-vehicle exports | Belgium `EXP` |
 |---|---|---|
 | Unit | vehicles (count) | tonnes (mass) |
 | Population | used vehicles exported for resale | end-of-life vehicles exported for treatment |
@@ -461,7 +461,8 @@ different measurements of different populations:
 **A used vehicle driven onto a ship at Antwerp is not an end-of-life vehicle
 and never enters `env_waselv_api`.** It leaves the fleet through
 deregistration and appears in no ELV statistic at all. This is the border
-where the regulatory statistics stop, and it is the whole of your hypothesis.
+where the regulatory statistics stop, and it is the whole of the Antwerp
+hypothesis.
 
 ### 4.3 Computing the ratio anyway, both ways
 
@@ -471,22 +472,34 @@ where the regulatory statistics stop, and it is the whole of your hypothesis.
 5,371 t / 1.261 t per vehicle  =  4,259 vehicle-equivalents
 ```
 
-| Construction | Belgium 2023 | Netherlands comparator |
-|---|---|---|
-| `EXP` vehicle-equivalents / fleet | 4,259 / 6,047,551 = **0.07%** | 237,875 / 986,000 = **24.1%** |
-| `EXP` tonnes / generated tonnes | 5,371 / 80,190 = **6.7%** | not available |
-| `EXP` vehicle-equivalents / ELVs generated | 4,259 / 63,592 = **6.7%** | not available |
+| Construction | Belgium 2023 |
+|---|---|
+| `EXP` vehicle-equivalents / fleet | 4,259 / 6,047,551 = **0.07%** |
+| `EXP` tonnes / generated tonnes | 5,371 / 80,190 = **6.7%** |
+| `EXP` vehicle-equivalents / ELVs generated | 4,259 / 63,592 = **6.7%** |
 
-### 4.4 The answer to your test
+**Which of these three is the right ratio depends on what it is being
+compared against.** A ratio built on the registered fleet and a ratio built
+on annual ELV volume differ here by a factor of roughly 100. They are not
+interchangeable, and a cross-country comparison that mixes the two will
+report a difference that is entirely definitional.
 
-**You asked whether Belgium's export-to-fleet ratio actually runs higher than
-the Netherlands, or whether that is an assumption the numbers do not support.**
+### 4.4 The Antwerp hypothesis, tested
 
-**The numbers do not support it, and more importantly the comparison as
-constructed is invalid.** Belgium's ratio computes to 0.07 percent against
-the Netherlands 24.1 percent, a factor of roughly 340. That difference is
-almost entirely a definitional artefact, not a behavioural one: it compares
-ELV waste exports against used-vehicle exports.
+**The proposition was that Belgium's used-vehicle export volume through
+Antwerp is large relative to its domestic fleet, and that this should show up
+as a high export-to-fleet ratio.**
+
+**The ELV statistics cannot test it.** `EXP` measures end-of-life vehicles
+exported for treatment, not used vehicles exported for resale. The Antwerp
+flow leaves as roadworthy vehicles and is absent from these tables entirely.
+Any ratio computed from `EXP` therefore answers a different question, and
+comparing it against another country's used-vehicle export count would
+produce a definitional artefact rather than a behavioural finding.
+
+**This is a measurement finding, not a null result.** The hypothesis is not
+disproved; it is untestable on this data and needs a vehicle-registration or
+trade source instead.
 
 **[DATA] What the data does support**, and it is a real finding: Belgium's
 ELV exports have **collapsed**, from 31.4 percent of generated tonnage in
@@ -507,25 +520,6 @@ in 2014, recovered to 15.2 percent by 2018, then fell again. A monotonic
 decline would suggest a structural change; this looks more like a reporting
 or policy discontinuity around 2014 to 2016. It should be checked before any
 claim is built on the trend.
-
-### 4.5 A caution on the Netherlands denominator
-
-**[OPEN]** The Netherlands comparator is given as 237,875 exports against "a
-fleet of roughly 986,000". **The Dutch passenger car fleet is approximately
-8.5 to 9 million vehicles, not 986,000.** A denominator of 986,000 is close
-to the Netherlands' annual ELV and deregistration volume, not its fleet.
-
-If 986,000 is in fact annual deregistrations, then the Netherlands 24.1
-percent is an **export-to-deregistration** ratio, and the correct Belgian
-analogue is the 6.7 percent in the table above, not the 0.07 percent. **That
-changes the comparison from a factor of 340 to a factor of 3.6.**
-
-**I flag this rather than resolve it because the Netherlands run is yours and
-I cannot see its construction.** Confirm what 986,000 counts before the two
-countries are put on a slide together. It is the single highest-risk number
-in this comparison.
-
----
 
 ## 5. Questions a professor is most likely to ask
 
@@ -554,10 +548,10 @@ in this comparison.
    Belgium and populated in the detailed table. Using the detailed table
    closes most of the gap. This trips up anyone using only `env_waselvt_api`.
 
-6. **"Is Belgium's export ratio higher than the Netherlands, as the Antwerp
-   story implies?"**
-   Not as measured, and the comparison is not valid as constructed. See 4.4.
-   Also confirm what the Netherlands 986,000 denominator counts, see 4.5.
+6. **"Does the Antwerp export story show up in the numbers?"**
+   Not in these numbers, and it cannot. `EXP` is ELV waste exported for
+   treatment; used vehicles exported for resale are absent from ELV
+   statistics entirely. Untestable here rather than disproved. See 4.4.
 
 7. **"Do you know whether high-value materials are stripped before
    shredding?"**
@@ -591,7 +585,6 @@ in this comparison.
 | `EXP` series | `env_waselv_api`, `waste='EXP'` | [DATA] |
 | All prices | section 3.5 table, each with source and date | [SOURCED] / [OPEN] |
 | Stripping behaviour | not resolvable from Eurostat | [ASSUMPTION] |
-| Netherlands 986,000 denominator | supplied, construction unverified | [OPEN] |
 
 **Eurostat vintage 28 April 2026 throughout. No API repull was performed.
 All Belgium figures come from the validated `elv_bronze` tables.**
