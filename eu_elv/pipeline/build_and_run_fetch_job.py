@@ -343,7 +343,7 @@ def create_or_update_job(creds_getter, image):
     wait_for_operation(creds_getter, r.json()["name"], "job create/update")
 
 
-def run_job(creds_getter, probe=False, dump=False, extra=None):
+def run_job(creds_getter, probe=False, dump=False, extra=None, comext=False):
     # Cloud Run applies containerOverrides per execution, so probe mode needs
     # no separate job spec or redeploy -- the deployed job is unchanged.
     body = {}
@@ -354,6 +354,8 @@ def run_job(creds_getter, probe=False, dump=False, extra=None):
         env.append({"name": "DUMP_STRUCTURE", "value": "1"})
     if extra:
         env.append({"name": "EXTRA_DATAFLOWS", "value": extra})
+    if comext:
+        env.append({"name": "COMEXT_PROBE", "value": "1"})
     if env:
         body = {"overrides": {"containerOverrides": [{"env": env}]}}
     r = requests.post(f"{RUN_BASE}/jobs/{JOB}:run",
@@ -393,6 +395,7 @@ def main():
     probe = "--probe" in sys.argv
     dump = "--dump-structure" in sys.argv
     extra = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--extra=")), None)
+    comext = "--comext-probe" in sys.argv
     creds = get_creds()
     if not preflight(creds):
         return 1
@@ -428,7 +431,11 @@ def main():
     if probe:
         print("running in PROBE mode: headers only, no BigQuery load")
 
-    execution = run_job(get_creds, probe=probe, dump=dump, extra=extra)
+    if comext:
+        print("running in COMEXT PROBE mode: DS-045409 structure only, no load")
+
+    execution = run_job(get_creds, probe=probe, dump=dump, extra=extra,
+                        comext=comext)
     ok = summarize_execution(execution)
     print("EXECUTION SUCCEEDED" if ok else "EXECUTION FAILED -- check Cloud Run job logs")
     return 0 if ok else 1

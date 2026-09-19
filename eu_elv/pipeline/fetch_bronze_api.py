@@ -248,6 +248,255 @@ def dump_structure(storage_client):
     return 0
 
 
+# -- Comext probe --------------------------------------------------------------
+# Task 1 of the scrap-price brief needs a steel scrap price series joinable to
+# country-year. Comext DS-045409 (detailed trade by reporter/partner/HS code)
+# gives HS 7204 -- ferrous waste and scrap -- from which an export unit value
+# (value / net mass) can be derived. It is free and needs no API key, which is
+# why it was chosen over UN Comtrade.
+#
+# The catch: Eurostat disabled unfiltered downloads of the Comext domain
+# because the datasets are enormous, so every query MUST carry filtering
+# parameters. That makes the dimension ids and their code formats load-bearing
+# -- a wrong key silently returns an empty dataset rather than an error.
+#
+# Those ids cannot be looked up from the dev sandbox (ec.europa.eu is blocked
+# there), and guessing at Eurostat's response shape burned a cycle in each of
+# three earlier probe rounds. So this reads the DSD first and *derives* the
+# data query from the dimension order it reports, instead of assuming one.
+COMEXT_FLOW = "DS-045409"
+
+# Comext is NOT on the main dissemination base: DS-045409 under agency ESTAT
+# there returns ERR_NOT_FOUND_4 for both datastructure and dataflow (probe
+# 20260919t041515). Eurostat fronts the Comext domain from its own path, so
+# the base itself is one of the unknowns. These get enumerated rather than
+# assumed -- the discovery stage lists each base's dataflows and finds which
+# one actually carries 045409, along with its agency and exact id spelling.
+COMEXT_BASES = [
+    ("dissemination", "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1"),
+    ("comext", "https://ec.europa.eu/eurostat/api/comext/dissemination/sdmx/2.1"),
+]
+
+# Substring -> filter value, applied case-insensitively to dimension ids.
+# Empty string means "leave the slot open" (SDMX wildcard = all codes).
+COMEXT_GUESSES = [
+    ("FREQ", "M"),
+    ("PRODUCT", "7204"),
+    ("PRCCODE", "7204"),
+    ("FLOW", "2"),      # 2 = exports in Comext's flow codelist, to confirm
+]
+
+
+def _ordered_dimensions(root):
+    """Dimension ids in key order. Order is the whole point: an SDMX key is
+    positional, so reading it off the DSD is what makes the query derivable
+    rather than guessed."""
+    dims = []
+    for kind in ("Dimension", "TimeDimension"):
+        for comp in root.iter(f"{{{NS['s']}}}{kind}"):
+            if not comp.get("id"):
+                continue
+            pos = comp.get("position")
+            # TimeDimension carries no position and always sorts last.
+            dims.append((int(pos) if pos else 10_000, comp.get("id"), kind))
+    dims.sort()
+    return [(d[1], d[2]) for d in dims]
+
+
+def _guess_for(dim_id):
+    upper = dim_id.upper()
+    for needle, value in COMEXT_GUESSES:
+        if needle in upper:
+            return value
+    return ""
+
+
+def _peek(storage_client, label, url, params, ts, cap=1_500_000):
+    """Issue one request and report what came back, reading at most `cap`.
+
+    Streamed and capped because a Comext query that ignores its filters can
+    return hundreds of MB, and the question here is only "what shape is it".
+    Status, Content-Type and byte count are captured unconditionally -- an
+    earlier probe round parsed before recording and threw away its best
+    result when the parse raised.
+    """
+    try:
+        resp = requests.get(url, params=params, timeout=300, stream=True)
+        body, total, truncated = b"", 0, False
+        for chunk in resp.iter_content(65_536):
+            total += len(chunk)
+            if len(body) < cap:
+                body += chunk
+            else:
+                truncated = True
+                break
+        resp.close()
+        ctype = resp.headers.get("Content-Type", "?")
+        print(f"  {label:34s} http={resp.status_code} "
+              f"type={ctype[:46]:46s} bytes={total:>10,}"
+              f"{'+ (TRUNCATED at cap)' if truncated else ''}")
+        print(f"      {resp.url}")
+        text = body.decode("utf-8", errors="replace")
+        for line in text.splitlines()[:4]:
+            print(f"      | {line[:200]}")
+        blob = f"comext-probe/{ts}/{label}.txt"
+        storage_client.bucket(BUCKET).blob(blob).upload_from_string(
+            text, content_type="text/plain")
+        return resp.status_code, text, truncated
+    except Exception as exc:
+        print(f"  {label:34s} ERROR {type(exc).__name__}: {exc}")
+        return None, "", False
+
+
+def _discover_comext(storage_client, ts):
+    """Find which base/agency/id actually serves DS-045409.
+
+    Returns (base_url, agency, flow_id) or None. Enumerating the dataflow
+    listing is cheaper than guessing across bases x agencies x id spellings,
+    and it reports the real answer instead of a plausible one.
+    """
+    for label, base in COMEXT_BASES:
+        status, text, _ = _peek(
+            storage_client, f"dataflows_{label}",
+            f"{base}/dataflow/all/all", {"detail": "allstubs"}, ts,
+            cap=40_000_000)
+        if status != 200 or not text.strip():
+            continue
+        try:
+            root = ET.fromstring(text.encode("utf-8"))
+        except ET.ParseError as exc:
+            print(f"      (listing not parseable: {exc})")
+            continue
+        flows = list(root.iter(f"{{{NS['s']}}}Dataflow"))
+        hits = [f for f in flows
+                if "045409" in (f.get("id") or "").replace("_", "-")]
+        print(f"      {len(flows):,} dataflows on this base; "
+              f"{len(hits)} matching 045409")
+        for f in hits:
+            print(f"       -> agency={f.get('agencyID')} id={f.get('id')} "
+                  f"version={f.get('version')} name={_english_name(f)}")
+        if hits:
+            return base, hits[0].get("agencyID"), hits[0].get("id")
+        # No 045409 here, but show what trade flows this base does carry --
+        # a differently-numbered Comext dataset is still usable for HS 7204.
+        trade = [f for f in flows
+                 if (f.get("id") or "").upper().startswith("DS-")][:12]
+        for f in trade:
+            print(f"       (DS- flow) id={f.get('id')} name={_english_name(f)}")
+    return None
+
+
+def comext_probe(storage_client):
+    """Resolve DS-045409's dimensions, then query it using them. Loads nothing."""
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dt%H%M%S")
+
+    print("\n=== discovery: which base serves Comext? ===")
+    found = _discover_comext(storage_client, ts)
+    if not found:
+        print("\nDS-045409 not found on any candidate base. Stopping rather "
+              "than guessing at a URL.")
+        return 1
+    base_url, agency, flow_id = found
+    print(f"\nresolved: base={base_url} agency={agency} id={flow_id}")
+
+    # Ordered cheapest-first. The descendants variant inlines the full CN8
+    # product codelist and ran past an 8MB read cap mid-document, which
+    # surfaced as a bogus "no element found" parse error rather than as the
+    # truncation it was. Only the dimension order is needed here, so ask for
+    # the components without their codelists and keep the big variant as a
+    # fallback with a cap that actually clears the payload.
+    print(f"\n=== structure: {agency}/{flow_id} ===")
+    root = None
+    for label, path, params, cap in (
+        ("ds_nocodes", f"datastructure/{agency}/{flow_id}",
+         {"detail": "full", "references": "none"}, 40_000_000),
+        ("ds_descendants", f"datastructure/{agency}/{flow_id}",
+         {"references": "descendants", "detail": "full"}, 40_000_000),
+    ):
+        status, text, truncated = _peek(
+            storage_client, f"structure_{label}",
+            f"{base_url}/{path}", params, ts, cap=cap)
+        if status != 200 or root is not None:
+            continue
+        if truncated:
+            print("      (truncated at cap -- not parsing a severed document)")
+            continue
+        try:
+            candidate = ET.fromstring(text.encode("utf-8"))
+        except ET.ParseError as exc:
+            print(f"      (not parseable as XML: {exc})")
+            continue
+        if _ordered_dimensions(candidate):
+            root = candidate
+            print(f"      -> using {label} for the dimension order")
+        else:
+            print("      (parsed, but declares no dimensions -- a stub)")
+
+    if root is None:
+        print("\nNo parseable DSD -- cannot derive the data key. Stopping here "
+              "rather than guessing at it.")
+        return 1
+
+    dims = _ordered_dimensions(root)
+    cl_by_comp = component_codelists(root)
+    inline = codelists_in(root)
+
+    print(f"\n=== dimensions in key order ({len(dims)}) ===")
+    for i, (dim_id, kind) in enumerate(dims):
+        cl_id = cl_by_comp.get(dim_id, "-")
+        guess = _guess_for(dim_id)
+        print(f"  {i}. {dim_id:16s} {kind:14s} codelist={cl_id:24s} "
+              f"filter={guess or '(all)'}")
+        if kind == "TimeDimension" or cl_id == "-":
+            continue
+        codes = inline.get(cl_id, [])
+        if not codes:
+            # references=none gives components without codelists, which is
+            # the point -- but the small ones (flow, freq, indicators) decide
+            # whether "2" really means exports and which measure carries net
+            # mass, so fetch those individually instead of burning a cycle.
+            if guess == "7204":
+                print("       (product codelist ~10k codes; not fetched)")
+                continue
+            status, text, trunc = _peek(
+                storage_client, f"codelist_{cl_id}",
+                f"{base_url}/codelist/{agency}/{cl_id}", {}, ts,
+                cap=4_000_000)
+            if status == 200 and not trunc:
+                try:
+                    codes = codelists_in(
+                        ET.fromstring(text.encode("utf-8"))).get(cl_id, [])
+                except ET.ParseError:
+                    codes = []
+        for code, lab in codes[:20]:
+            print(f"       {code:14s} {lab[:70]}")
+        if len(codes) > 20:
+            print(f"       ... {len(codes) - 20:,} more")
+
+    # Build the positional key from the DSD's own ordering. Time is excluded:
+    # SDMX carries it in startPeriod/endPeriod, not in the key.
+    key_dims = [d for d, kind in dims if kind != "TimeDimension"]
+    key = ".".join(_guess_for(d) for d in key_dims)
+
+    print(f"\n=== data: key='{key}' over [{', '.join(key_dims)}] ===")
+    base = f"{base_url}/data/{flow_id}"
+    window = {"startPeriod": "2023-01", "endPeriod": "2023-12"}
+    _peek(storage_client, "data_key_csv", f"{base}/{key}",
+          {"format": "SDMX-CSV", "compressed": "false", **window}, ts)
+    # Parameter-style filtering, in case Comext rejects positional keys.
+    param_style = {d: _guess_for(d) for d in key_dims if _guess_for(d)}
+    _peek(storage_client, "data_params_csv", base,
+          {"format": "SDMX-CSV", "compressed": "false",
+           **param_style, **window}, ts)
+    # No time window: confirms whether the filter alone satisfies Eurostat's
+    # "must be filtered" rule, which decides if a 2005-2023 pull is one call.
+    _peek(storage_client, "data_key_csv_alltime", f"{base}/{key}",
+          {"format": "SDMX-CSV", "compressed": "false"}, ts)
+
+    print(f"\nResponses saved under gs://{BUCKET}/comext-probe/{ts}/")
+    return 0
+
+
 # -- additional dataflows ------------------------------------------------------
 def fetch_extra_dataflows(storage_client, bq_client, codes):
     """Pull arbitrary Eurostat dataflows into Bronze.
@@ -579,6 +828,10 @@ def _run(creds):
     if os.environ.get("PROBE_ONLY") == "1":
         print("PROBE_ONLY=1 -- probing API formats, loading nothing")
         return probe_formats(storage_client)
+
+    if os.environ.get("COMEXT_PROBE") == "1":
+        print("COMEXT_PROBE=1 -- resolving DS-045409 structure, loading nothing")
+        return comext_probe(storage_client)
 
     bq_client = bigquery.Client(project=PROJECT, credentials=creds)
 
