@@ -309,7 +309,120 @@ presented as such.**
 **To close the gap you need exactly two numbers:** the copper share of
 `W191002`, and grams of PGM per tonne of catalyst. Both are obtainable from
 a Belgian shredder operator or from published recycling-industry
-coefficients. Neither is in Eurostat.
+coefficients. Neither is in Eurostat. A third number, the ferrous against
+non-ferrous split of `W1601B`, is not needed for the value total but is
+needed to sharpen the recovery estimate in 3.7.
+
+### 3.7 Closing the open inputs: run both methods, not one
+
+The four [OPEN] inputs in 3.5 can be closed two different ways, and the two
+ways answer **different questions**. Running both is not redundancy. The
+difference between them is the result.
+
+| Method | What you do | What it tells you |
+|---|---|---|
+| **Top-down** | Apply published material composition per vehicle to Belgium's 63,592 vehicles / 80,190 t | What is **physically present** in the stream |
+| **Bottom-up** | Obtain actual recovered tonnages by material from Febelauto or an operator | What was **actually recovered** |
+
+**These are not interchangeable.** Applying top-down composition figures and
+labelling the output "recovered value" would be wrong: the number produced is
+value *present*, not value *captured*. The gap between the two is the
+recycling gap expressed in materials rather than in compliance percentages,
+which is the capstone thesis stated in one number.
+
+Bottom-up is also the only route that settles the stripping question in 3.4.
+Top-down describes what went into the shredder and can never say what came
+out separately.
+
+#### 3.7.1 Worked reconciliation **[DERIVED]**
+
+Using the sourced anchors from 3.5 and the mass data from 3.1:
+
+| Component | Tonnes | Basis |
+|---|---|---|
+| Top-down copper | 1,590 | 25 kg/vehicle x 63,592 vehicles **[SOURCED anchor]** |
+| Top-down aluminium | 6,415 | 8% of 80,190 t **[SOURCED anchor]** |
+| **Top-down non-ferrous present** | **8,005** | sum |
+| Bottom-up `W191002` recovered | 4,907 | **[DATA]** |
+| `W1601B` metal components | 4,960 | **[DATA]**, Fe/non-Fe split unknown |
+
+Because `W1601B` is an unresolved mix, the answer is a **bracket rather than
+a point estimate**, which is the honest form:
+
+- If `W1601B` is **entirely ferrous**: **3,098 t of non-ferrous is not
+  recovered as non-ferrous, 39 percent of what is present.**
+- If `W1601B` is **entirely non-ferrous**: the gap closes to **zero**.
+
+The truth sits between these, and **one number from the operator collapses
+the bracket to a point estimate.** That is a far sharper request than asking
+for a data extract.
+
+#### 3.7.2 The consistency check that makes this credible
+
+A top-down estimate is only worth reporting if the implied missing mass has
+somewhere physical to go. It does:
+
+```
+unrecovered non-ferrous (upper bound)   3,098 t
+Shredder Light Fraction (W1910A)        6,948 t
+                                        3,098 / 6,948 = 45%
+```
+
+The missing non-ferrous fits inside SLF with room to spare. **If the
+top-down method had implied 20,000 t of unaccounted copper, the method would
+be broken and should be discarded.** It does not, so the estimate survives
+its own sanity check. This check should be reported alongside the bracket,
+because it is what distinguishes an estimate from a guess.
+
+#### 3.7.3 The vintage correction, which is not optional
+
+**[ASSUMPTION, and the one most likely to be challenged]** The 8 percent
+aluminium anchor is a current-fleet figure. **Vehicles scrapped in Belgium in
+2023 were built around 2005 to 2010**, since average EU scrappage age is
+roughly 15 years. Aluminium content in new cars has risen substantially over
+that period, so applying a 2023 new-car composition to a 2008-build vehicle
+**overstates aluminium, plausibly by up to a third.**
+
+The correction is to use composition **at build year**, not at scrappage
+year. This is precisely what the JRC "Material composition **trends** in
+vehicles" report exists to provide; the trend line is the point of it.
+
+**Copper travels better across vintages than aluminium does.** Wiring harness
+mass has been comparatively stable, so the 25 kg/vehicle anchor is the more
+robust of the two and the aluminium figure carries most of the vintage risk.
+
+**Without the vintage adjustment the top-down side will not survive review.
+With it, it will.**
+
+### 3.8 Provenance of the routes to the open inputs
+
+| Open input | Route | Source | Status |
+|---|---|---|---|
+| P7 copper share, P8 aluminium share | Top-down | JRC126564, "Material composition trends in vehicles", European Commission Joint Research Centre | **Lead, not verified.** `rmis.jrc.ec.europa.eu` is blocked from the analysis sandbox, so the contents could not be confirmed here |
+| P8 aluminium | Top-down | [European Aluminium, *Aluminium Content in Passenger Vehicles (Europe)*](https://european-aluminium.eu/wp-content/uploads/2023/05/23-05-02Aluminum-Content-in-Cars_Public-Summary.pdf) | Europe-specific, roughly 123 kg castings per vehicle, roughly 80 kg in powertrain |
+| P9 PGM grams per tonne | Both | [Johnson Matthey PGM Market Report](https://matthey.com/media/2026/johnson-matthey-publishes-2026-pgm-market-report1) | Free, annual, the industry reference. Gives market-level autocatalyst recovery; per-converter loading may need a teardown study on top |
+| P10 semiconductors | Top-down only | No statistical source exists; teardown and academic literature only | Hardest of the four, and may stay [OPEN] |
+| P7, P9, and the `W1601B` split | Bottom-up | **Febelauto**, Belgium's ELV compliance scheme | See Appendix A |
+
+**Why Febelauto is the right counterparty, evidenced rather than assumed.**
+Febelauto reported **81,350 vehicles collected in 2022**, which matches the
+Eurostat `GEN` count for Belgium in 2022 in this dataset **exactly** (see
+2.2). That identity establishes the reporting chain as ATFs to Febelauto to
+Eurostat, which means **Febelauto holds the granularity that Eurostat
+aggregates away before publication.** They operate a network of over 100
+authorised treatment facilities and publish annual reports in Dutch and
+French.
+
+Source: [Recycling International on Belgium ELV
+performance](https://recyclinginternational.com/business/95-elv-recycling-target-within-reach-for-belgium/5491/),
+[Febelauto](https://www.febelauto.be/).
+
+**Incidental finding relevant to the other workstream.** The "over 100 ATFs"
+figure is an operator count for Belgium. The scrap price case needs an
+operator concentration measure and found permitted storage capacity to be
+unharmonised. Compliance schemes such as Febelauto may hold ATF counts per
+country that Eurostat SBS does not publish at 4-digit NACE. Worth checking
+before settling for the SBS route.
 
 ---
 
@@ -482,3 +595,45 @@ in this comparison.
 
 **Eurostat vintage 28 April 2026 throughout. No API repull was performed.
 All Belgium figures come from the validated `elv_bronze` tables.**
+
+---
+
+## Appendix A. Data request to Febelauto
+
+Three specific numbers, not a data extract. Each one is named because it
+closes a stated gap in this analysis, and the request says which. A narrow,
+justified ask is far more likely to be answered than a general one.
+
+**Ask 1. The ferrous against non-ferrous split of dismantled metal
+components.**
+Eurostat code `W1601B`, 4,960 tonnes for Belgium in 2023. This is currently
+the single number preventing a point estimate: with it, the unrecovered
+non-ferrous bracket in 3.7.1 collapses from "somewhere between 0 and 3,098
+tonnes" to one figure.
+
+**Ask 2. Platinum, palladium and rhodium content per tonne of catalyst.**
+Eurostat code `W1608`, 93 tonnes for Belgium in 2023, reported as gross mass
+only. Grams per tonne, or total grams recovered, either is usable. Without it
+no PGM value can be computed at all.
+
+**Ask 3. Whether wiring harnesses and electronic modules are removed before
+shredding.**
+A yes or no with an approximate share is enough. Section 3.4 carries
+"regulatory stripping only" as an explicit unverified assumption, and the
+answer materially changes the recovered value estimate. Eurostat reports
+treatment routes rather than material content and cannot settle it.
+
+**Useful context to include in the approach.** Their published figure of
+81,350 vehicles collected in 2022 matches the Eurostat `GEN` count for
+Belgium exactly, which is worth stating: it shows the request comes from
+someone who has already reconciled the published data and is asking only for
+what sits beneath it.
+
+**Optional fourth ask, for the scrap price workstream.** The number of
+authorised treatment facilities per year, which would give an operator
+concentration series that Eurostat SBS may suppress at 4-digit NACE 38.31.
+
+**If Febelauto cannot share operator-level data,** the fallback is that Asks
+1 and 2 are also obtainable from any single Belgian shredder operator, and
+Ask 2 from published recycling-industry assay coefficients. Ask 3 has no
+documentary substitute and would remain [OPEN].
