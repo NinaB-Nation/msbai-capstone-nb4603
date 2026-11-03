@@ -219,3 +219,10 @@ __marimo__/
 
 # Raw source data lands durably in GCS, not git -- see eu_elv/DECISIONS.md
 eu_elv/pipeline/data_raw/*.csv
+
+# Task 2.12b: credentials and raw downloads
+*-sa-key.json
+credentials*.json
+*key*.json
+.env
+anomaly_detection/2_12b/data_raw/
